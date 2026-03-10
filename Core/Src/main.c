@@ -24,6 +24,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "motors.h"
+#include "lab_sequence.h"
 #include "FreeRTOS.h"
 #include "task.h"
 /* USER CODE END Includes */
@@ -62,7 +64,11 @@ void vBlinkTask(void *pvParameters) {
         HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5); // Zmień na swój pin diody
         vTaskDelay(pdMS_TO_TICKS(500));        // Czekaj 500 ms
     }
-}   
+}
+
+
+
+
 /* USER CODE END 0 */
 
 /**
