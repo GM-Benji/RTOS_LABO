@@ -1,4 +1,7 @@
 #include "motors.h"
+#include "stm32f1xx_hal_tim.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 // --- UCHWYTY TIMERÓW ---
 extern TIM_HandleTypeDef htim1; // Dla Talon SRX (PB14)
@@ -18,6 +21,9 @@ extern TIM_HandleTypeDef htim4;
 #define DRILL_LOWER_IN2_CH TIM_CHANNEL_3
 #define DRILL_LOWER_IN1_CH TIM_CHANNEL_4
 
+extern TIM_HandleTypeDef htim4;
+
+volatile int32_t encoder_overflows = 0;
 // ==========================================================
 // 1. NAPĘD WIERTŁA (TALON SRX - Sygnał RC 50Hz)
 // ==========================================================
@@ -100,6 +106,9 @@ void MotorsControl_Init(void) {
     HAL_TIM_PWM_Start(&htim3, DRILL_LOWER_IN2_CH);   // PB0
     HAL_TIM_PWM_Start(&htim3, DRILL_LOWER_IN1_CH);   // PB1
 
+    HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
+    __HAL_TIM_ENABLE_IT(&htim4, TIM_IT_UPDATE);
+
     // ------------------------------------------------------
     // C. Start kanału PWM (TIM1 - Talon SRX)
     // ------------------------------------------------------
@@ -110,7 +119,7 @@ void MotorsControl_Init(void) {
 
 
 // Deklaracja timera enkodera (np. TIM4, sprawdź w CubeMX czy tak go nazwałeś)
-extern TIM_HandleTypeDef htim4;
+
 
 // Zatrzymuje wszystko (SCRAM)
 void EmergencyStopMotors(void) {
@@ -124,10 +133,41 @@ void StopStirrer(void) {
     SetStirrerSpeed_MC34931(0, 0);
 }
 
-// Odczyt aktualnej pozycji wiertła
 int32_t GetDrillPosition(void) {
-    return (int32_t)__HAL_TIM_GET_COUNTER(&htim4);
+    int32_t overflows;
+    uint32_t current_cnt;
+
+    // Używamy sekcji krytycznej FreeRTOS, aby przerwanie nie wpadło
+    // dokładnie pomiędzy odczytem 'overflows' a odczytem 'CNT'.
+    // To zapobiega tzw. Race Conditions (błędom jednoczesnego dostępu).
+    taskENTER_CRITICAL();
+    overflows = encoder_overflows;
+    current_cnt = __HAL_TIM_GET_COUNTER(&htim4);
+    taskEXIT_CRITICAL();
+    
+    // Całkowita pozycja to: (ilość_przepełnień * 65536) + aktualny_stan_licznika
+    return (overflows << 16) | current_cnt; 
 }
+
+void ResetDrillEncoder(void) {
+    taskENTER_CRITICAL();
+    __HAL_TIM_SET_COUNTER(&htim4, 0);
+    encoder_overflows = 0;
+    taskEXIT_CRITICAL();
+}
+
+// Własna funkcja obsługi przepełnienia enkodera
+void DrillEncoder_OverflowCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM4) {
+        if (__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim4)) {
+            encoder_overflows--;
+        } else {
+            encoder_overflows++;
+        }
+    }
+}
+
+
 
 // Sprawdzenie czy wiertło jest na odpowiedniej głębokości
 uint8_t IsDrillAtTargetDepth(int32_t target_ticks) {
@@ -139,12 +179,13 @@ uint8_t IsDrillAtTargetDepth(int32_t target_ticks) {
 
 
 
-void ResetDrillEncoder(void) {
-    __HAL_TIM_SET_COUNTER(&htim4, 0);
-}
-
 // Krańcówka (Homing) na PB12
 uint8_t IsDrillHomed(void) {
     // Zwraca 1 jeśli krańcówka jest wciśnięta (zakładamy, że zwiera do GND, więc stan LOW = wciśnięta)
     return (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_12) == GPIO_PIN_RESET) ? 1 : 0;
+}
+
+// Zwraca 1, jeśli przycisk S_SWITCH (PB13) jest wciśnięty (zwarty do masy)
+uint8_t IsStartSwitchPressed(void) {
+    return (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13) == GPIO_PIN_RESET) ? 1 : 0;
 }
