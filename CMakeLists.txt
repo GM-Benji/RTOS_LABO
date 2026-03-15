@@ -55,6 +55,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     freeRTOS/Src/timers.c
     Core/Src/motors.c
     Core/Src/lab_sequence.c
+    Core/Src/dynamixel.c
 )
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE

@@ -5,11 +5,13 @@
 #include "semphr.h"
 #include "event_groups.h"
 #include "motors.h"
+#include "dynamixel.h"
 // ... inne includy RTOS
 
 typedef enum {
     LAB_STATE_IDLE,
     LAB_STATE_HOMING,              // zerowanie wiertła (krańcówka)[cite: 1, 3]
+    LAB_STATE_HOMING_REVOLVERS,
     LAB_STATE_DRILLING,            // odwiert na zadaną głębokość[cite: 1, 3]
     LAB_STATE_RETRACT,             // powrót nad probówkę[cite: 1, 3]
     LAB_STATE_TUBE_POS,            // podjazd dolnym rewolwerem[cite: 1, 3]
@@ -31,6 +33,16 @@ typedef enum {
 EventGroupHandle_t xSystemEvents;
 SemaphoreHandle_t xMotorPowerMutex;
 QueueHandle_t xDynamixelQueue;
+
+// Struktura komendy dla serwa
+typedef struct {
+    uint8_t servo_id;
+    uint16_t target_position;
+} DynamixelCmd_t;
+
+// Pamiętaj, żeby uchwyt do kolejki był widoczny globalnie w tym pliku
+extern QueueHandle_t xDynamixelQueue;
+
 
 // Usunięto zbędny: extern TIM_HandleTypeDef htim4;
 
@@ -195,21 +207,21 @@ void vTaskLabSequence(void *pvParameters) {
             case LAB_STATE_DRILLING:
                 if(xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     xEventGroupSetBits(xSystemEvents, BIT_DRILL_LOWERED);
-                    
-                    // UWAGA: Ponieważ nie mamy fizycznie podpiętego enkodera, 
+
+                    // UWAGA: Ponieważ nie mamy fizycznie podpiętego enkodera
                     // warunek (pozycja > 15000) nigdy nie zostanie spełniony.
                     // Maszyna zablokuje się w tym stanie, co jest idealne do pomiarów!
                     if (IsDrillAtTargetDepth(4*65535)) {
-                        SetDrillLoweringSpeed_MC34931(0, 0); 
-                        SetDrillSpinSpeed_Talon(0);
+                        SetDrillLoweringSpeed_MC34931(0, 0);
+                        //SetDrillSpinSpeed_Talon(0);
                         xSemaphoreGive(xMotorPowerMutex);
                         currentState = LAB_STATE_RETRACT;
                     } else {
                          // POMIAR 1: PB0 powinien mieć PWM 80% (ok. 2.6V), PB1 ma 0V.
                          // POMIAR 2: PB14 (Talon) wygeneruje sygnał RC (na multimetrze to ułamek wolta)
-                         SetDrillSpinSpeed_Talon(80);           // Kręcenie (Talon)
+                         SetDrillSpinSpeed_Talon(-80);           // Kręcenie (Talon)
                          SetDrillLoweringSpeed_MC34931(800, 1); // 1 = W DÓŁ (MC34931)
-                         xSemaphoreGive(xMotorPowerMutex); 
+                         xSemaphoreGive(xMotorPowerMutex);
                     }
                 }
                 break;
@@ -218,14 +230,16 @@ void vTaskLabSequence(void *pvParameters) {
                 if (IsDrillHomed()) {
                     // 1. BEZPIECZEŃSTWO: Natychmiast zatrzymaj silnik
                     SetDrillLoweringSpeed_MC34931(0, 0);
-                    
+                    SetDrillSpinSpeed_Talon(0);
+
+
                     // 2. DEBOUNCE: 50ms przerwy
                     vTaskDelay(pdMS_TO_TICKS(100));
-                    
+
                     // 3. WERYFIKACJA
                     if (IsDrillHomed()) {
                         xEventGroupClearBits(xSystemEvents, BIT_DRILL_LOWERED);
-                        currentState = LAB_STATE_TUBE_POS; 
+                        currentState = LAB_STATE_TUBE_POS;
                     }
                 } else {
                     SetDrillLoweringSpeed_MC34931(800, 2); // 2 = W GÓRĘ
@@ -235,7 +249,7 @@ void vTaskLabSequence(void *pvParameters) {
             case LAB_STATE_STIRRING:
                 if(xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     // POMIAR: PA6 lub PA7 wygeneruje PWM 50%
-                    SetStirrerSpeed_MC34931(500, 1); 
+                    SetStirrerSpeed_MC34931(500, 1);
                     vTaskDelay(pdMS_TO_TICKS(5000)); // Mieszaj przez 5 sekund
                     StopStirrer();
                     xSemaphoreGive(xMotorPowerMutex);
@@ -243,6 +257,37 @@ void vTaskLabSequence(void *pvParameters) {
                 }
                 break;
 
+            case LAB_STATE_TUBE_POS:
+            {
+                DynamixelCmd_t moveCmd;
+                moveCmd.servo_id = DYNAMIXEL_TUBE_ID;
+                moveCmd.target_position = 512; // Zmień na właściwą pozycję dla probówki
+                
+                // Wrzucamy komendę do kolejki
+                xQueueSend(xDynamixelQueue, &moveCmd, portMAX_DELAY);
+                
+                // Czekamy, aż serwo dojedzie na miejsce
+                // (Wersja prosta: opóźnienie czasowe. Wersja zaawansowana: odczytywanie statusu)
+                vTaskDelay(pdMS_TO_TICKS(1000)); 
+                
+                currentState = LAB_STATE_FILL_TUBE;
+                break;
+            }
+            
+            // (...) (Tutaj będą inne stany, np. napełnianie, i po nim jazda do rewolweru z chemią)
+            
+            case LAB_STATE_REAGENT_POS:
+            {
+                DynamixelCmd_t moveCmd;
+                moveCmd.servo_id = DYNAMIXEL_SYRINGE_ID;
+                moveCmd.target_position = 256; // Zmień na właściwą pozycję dla strzykawki
+                
+                xQueueSend(xDynamixelQueue, &moveCmd, portMAX_DELAY);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                
+                currentState = LAB_STATE_DOSING;
+                break;
+            }
             default:
                 currentState = LAB_STATE_IDLE;
                 break;
@@ -251,9 +296,45 @@ void vTaskLabSequence(void *pvParameters) {
     }
 }
 
+void vTaskDynamixel(void *pvParameters) {
+    DynamixelCmd_t currentCmd;
+    
+    for(;;) {
+        // Task zasypia i czeka, aż w kolejce pojawi się komenda
+        if(xQueueReceive(xDynamixelQueue, &currentCmd, portMAX_DELAY) == pdTRUE) {
+            
+            EventBits_t events = xEventGroupGetBits(xSystemEvents);
+            
+            // ZABEZPIECZENIE 1: SCRAM
+            if(events & BIT_SCRAM_ACTIVE) {
+                continue; // Ignorujemy komendę
+            }
+            
+            // ZABEZPIECZENIE 2: Wiertło w dół = blokada rewolwerów!
+            if(events & BIT_DRILL_LOWERED) {
+                // Tutaj w przyszłości możemy wysłać ramkę błędu po CAN do Bena
+                continue; // Wiertło jest w dół, odrzucamy komendę obrotu
+            }
+            
+            // --- WYSYŁANIE RAMKI UART ---
+            // Jeśli tu dotarliśmy, jest bezpiecznie. Wysyłamy fizycznie komendę.
+            AX12_SetGoalPosition(currentCmd.servo_id, currentCmd.target_position);
+            
+            // Mały delay, żeby nie zasypać magistrali UART
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+}
+
 void LabRTOS_Init(void) {
     xSystemEvents = xEventGroupCreate();
     xMotorPowerMutex = xSemaphoreCreateMutex();
+
+    xDynamixelQueue = xQueueCreate(5, sizeof(DynamixelCmd_t));
+
     // Tworzenie tasków[cite: 3]
     xTaskCreate(vTaskLabSequence, "AutoSeq", 512, NULL, tskIDLE_PRIORITY + 2, NULL);
+
+    xTaskCreate(vTaskDynamixel, "Dynamixel", 256, NULL, tskIDLE_PRIORITY+3, NULL);
+
 }
