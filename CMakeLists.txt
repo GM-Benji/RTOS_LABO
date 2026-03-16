@@ -56,11 +56,22 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/motors.c
     Core/Src/lab_sequence.c
     Core/Src/dynamixel.c
+    SystemView/SYSVIEW/SEGGER_SYSVIEW.c
+    RTT/RTT/SEGGER_RTT.c
+    RTT/RTT/SEGGER_RTT_ASM_ARMv7M.S
+    SystemView/Sample/FreeRTOSV11/SEGGER_SYSVIEW_FreeRTOS.c
+    SystemView/Sample/FreeRTOSV11/Config/Cortex-M/SEGGER_SYSVIEW_Config_FreeRTOS.c
 )
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     freeRTOS/include
+    SystemView/Config
+    SystemView/SEGGER
+    SystemView/SYSVIEW
+    RTT/Config
+    RTT/RTT
+    SystemView/Sample/FreeRTOSV11
 )
 
 # Add project symbols (macros)

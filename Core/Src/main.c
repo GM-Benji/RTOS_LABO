@@ -30,6 +30,7 @@
 #include "lab_sequence.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "SEGGER_SYSVIEW.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -97,7 +98,10 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
+  /* Włączenie sprzętowego licznika cykli DWT dla Segger SystemView */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -109,7 +113,7 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 // Tworzenie zadania (Czyste API FreeRTOS zamiast osThreadCreate)
-  
+  SEGGER_SYSVIEW_Conf();
   MotorsControl_Init();
   LabRTOS_Init();
 

@@ -50,7 +50,7 @@
 #define configTICK_RATE_HZ              ((TickType_t)1000)
 #define configMAX_PRIORITIES            (5)
 #define configMINIMAL_STACK_SIZE        ((unsigned short)128)
-#define configTOTAL_HEAP_SIZE           ((size_t)(17 * 1024))
+#define configTOTAL_HEAP_SIZE           ((size_t)(14 * 1024))
 #define configMAX_TASK_NAME_LEN         (16)
 #define configUSE_TRACE_FACILITY        1
 #define configUSE_16_BIT_TICKS          0
@@ -95,4 +95,6 @@ extern uint32_t SystemCoreClock;
 #define vPortSVCHandler     SVC_Handler
 #define xPortPendSVHandler  PendSV_Handler
 #define xPortSysTickHandler SysTick_Handler
+
+#include "SEGGER_SYSVIEW_FreeRTOS.h"
 #endif /* FREERTOS_CONFIG_H */
