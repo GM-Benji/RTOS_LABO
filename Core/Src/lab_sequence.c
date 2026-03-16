@@ -38,8 +38,12 @@ typedef enum
 #define TUBE_BASE_POS    790 // Pozycja pierwszej probówki pod wiertłem
 #define TUBE_SPACING     123 // Offset 36 stopni (36 / 0.293 st/jednostkę = ~123)
 
+#define SYRINGE_BASE_POS    800 // Pozycja pierwszej strzykawki
+#define SYRINGE_SPACING     123 // Offset 36 stopni (36 / 0.293 st/jednostkę = ~123)
+
 // Zmienna przechowująca numer aktualnej probówki (np. od 0 do 5)
 static uint8_t current_tube_index = 6;
+static uint8_t current_syringe_index = 4;
 
 EventGroupHandle_t xSystemEvents;
 SemaphoreHandle_t xMotorPowerMutex;
@@ -133,6 +137,8 @@ void vTaskLabSequence(void* pvParameters)
                 xEventGroupClearBits(xSystemEvents, BIT_START_AUTO); // Czyścimy flagę, żeby nie wyzwalała się podwójnie
                 currentState = LAB_STATE_HOMING;
             }
+            current_tube_index = 6;
+            current_syringe_index = 4;
             break;
 
         case LAB_STATE_HOMING:
@@ -238,7 +244,7 @@ void vTaskLabSequence(void* pvParameters)
             if (xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE)
             {
                 // POMIAR: PA6 lub PA7 wygeneruje PWM 50%
-                SetStirrerSpeed_MC34931(500, 1);
+                SetStirrerSpeed_MC34931(100, 1);
                 vTaskDelay(pdMS_TO_TICKS(5000)); // Mieszaj przez 5 sekund
                 StopStirrer();
                 xSemaphoreGive(xMotorPowerMutex);
@@ -297,7 +303,7 @@ void vTaskLabSequence(void* pvParameters)
                 current_tube_index--;
 
                 // Logika: 1 odwiert = 2 probówki
-                if (current_tube_index % 2 != 0)
+                if (current_tube_index % 2 != 0 && current_tube_index>0)
                 {
                     // Napełniliśmy nieparzystą liczbę probówek (np. pierwszą z pary)
                     // Wracamy do obrotu rewolwerem pod kolejną probówkę
@@ -307,7 +313,7 @@ void vTaskLabSequence(void* pvParameters)
                 {
                     // Napełniliśmy parzystą liczbę (np. drugą z pary)
                     // Gleba się skończyła. Przechodzimy do dozowania odczynników!
-                    currentState = LAB_STATE_IDLE;
+                    currentState = LAB_STATE_REAGENT_POS;
                 }
             }
             break;
@@ -319,12 +325,27 @@ void vTaskLabSequence(void* pvParameters)
         {
             DynamixelCmd_t moveCmd;
             moveCmd.servo_id = DYNAMIXEL_SYRINGE_ID;
-            moveCmd.target_position = 256; // Zmień na właściwą pozycję dla strzykawki
+            uint16_t calc_pos = SYRINGE_BASE_POS - (current_syringe_index * SYRINGE_SPACING);
+            moveCmd.target_position = calc_pos; // Zmień na właściwą pozycję dla strzykawki
 
             xQueueSend(xDynamixelQueue, &moveCmd, portMAX_DELAY);
             vTaskDelay(pdMS_TO_TICKS(1000));
 
             currentState = LAB_STATE_DOSING;
+            break;
+        }
+        case LAB_STATE_DOSING:
+        {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            if(current_syringe_index)
+            {
+                currentState=LAB_STATE_REAGENT_POS;
+                current_syringe_index--;
+            }
+            else 
+            {
+                currentState = LAB_STATE_IDLE;
+            }
             break;
         }
         default:
