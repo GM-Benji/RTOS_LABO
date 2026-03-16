@@ -34,12 +34,14 @@ typedef enum
 
 // --- PARAMETRY MECHANICZNE REWOLWERÓW ---
 #define POS_SAFE_TUBE    1023 // Bezpieczna pozycja dla rewolweru z probówkami (nie koliduje z wiertłem)
-#define POS_SAFE_SYRINGE 600 // Bezpieczna pozycja dla rewolweru ze strzykawką (nie koliduje z wiertłem)
-#define TUBE_BASE_POS    790 // Pozycja pierwszej probówki pod wiertłem
-#define TUBE_SPACING     123 // Offset 36 stopni (36 / 0.293 st/jednostkę = ~123)
+#define POS_SAFE_SYRINGE 600  // Bezpieczna pozycja dla rewolweru ze strzykawką (nie koliduje z wiertłem)
+#define TUBE_BASE_POS    790  // Pozycja pierwszej probówki pod wiertłem
+#define TUBE_SPACING     123  // Offset 36 stopni (36 / 0.293 st/jednostkę = ~123)
 
-#define SYRINGE_BASE_POS    800 // Pozycja pierwszej strzykawki
-#define SYRINGE_SPACING     123 // Offset 36 stopni (36 / 0.293 st/jednostkę = ~123)
+#define SYRINGE_BASE_POS 485 // Pozycja pierwszej strzykawki
+#define SYRINGE_SPACING  132
+
+#define TUBE_STIR_POS 514 // Pozycja pierwszej probówki nad mieszadlem
 
 // Zmienna przechowująca numer aktualnej probówki (np. od 0 do 5)
 static uint8_t current_tube_index = 6;
@@ -289,7 +291,7 @@ void vTaskLabSequence(void* pvParameters)
 
                 // 1. Zrzucanie gleby: obroty CCW (wartość dodatnia)
                 // Możesz tu wpisać odpowiednią moc, np. 80 lub 100
-                //SetDrillSpinSpeed_Talon(80);
+                // SetDrillSpinSpeed_Talon(80);
 
                 // 2. Czekamy równo 2 sekundy
                 vTaskDelay(pdMS_TO_TICKS(2000));
@@ -303,7 +305,7 @@ void vTaskLabSequence(void* pvParameters)
                 current_tube_index--;
 
                 // Logika: 1 odwiert = 2 probówki
-                if (current_tube_index % 2 != 0 && current_tube_index>0)
+                if (current_tube_index % 2 != 0 && current_tube_index > 0)
                 {
                     // Napełniliśmy nieparzystą liczbę probówek (np. pierwszą z pary)
                     // Wracamy do obrotu rewolwerem pod kolejną probówkę
@@ -324,8 +326,30 @@ void vTaskLabSequence(void* pvParameters)
         case LAB_STATE_REAGENT_POS:
         {
             DynamixelCmd_t moveCmd;
+            moveCmd.servo_id = DYNAMIXEL_TUBE_ID;
+
+            uint16_t calc_pos = TUBE_STIR_POS;
+
+            moveCmd.target_position = calc_pos;
+            xQueueSend(xDynamixelQueue, &moveCmd, portMAX_DELAY);
+
+            // INTELIGENTNE CZEKANIE (z maksymalnym timeoutem 5 sekund)
+            if (WaitForServoPosition(DYNAMIXEL_TUBE_ID, calc_pos, 5000))
+            {
+                // Serwo dojechało, kontynuujemy cykl
+
+                currentState = LAB_STATE_FILL_TUBE;
+            }
+            else
+            {
+                // ERROR! Serwo zablokowane. Zatrzymujemy maszynę!
+                // Tutaj w przyszłości można wysłać komunikat po CAN do Bena
+                EmergencyStopMotors();
+                currentState = LAB_STATE_IDLE;
+            }
+            //DynamixelCmd_t moveCmd;
             moveCmd.servo_id = DYNAMIXEL_SYRINGE_ID;
-            uint16_t calc_pos = SYRINGE_BASE_POS - (current_syringe_index * SYRINGE_SPACING);
+            calc_pos = SYRINGE_BASE_POS - (current_syringe_index * SYRINGE_SPACING);
             moveCmd.target_position = calc_pos; // Zmień na właściwą pozycję dla strzykawki
 
             xQueueSend(xDynamixelQueue, &moveCmd, portMAX_DELAY);
@@ -337,12 +361,12 @@ void vTaskLabSequence(void* pvParameters)
         case LAB_STATE_DOSING:
         {
             vTaskDelay(pdMS_TO_TICKS(500));
-            if(current_syringe_index)
+            if (current_syringe_index)
             {
-                currentState=LAB_STATE_REAGENT_POS;
+                currentState = LAB_STATE_REAGENT_POS;
                 current_syringe_index--;
             }
-            else 
+            else
             {
                 currentState = LAB_STATE_IDLE;
             }

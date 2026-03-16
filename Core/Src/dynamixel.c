@@ -284,4 +284,10 @@ void AX12_Init(void)
     vTaskDelay(pdMS_TO_TICKS(10));
     AX12_SetMovingSpeed(DYNAMIXEL_SYRINGE_ID, 100);
     vTaskDelay(pdMS_TO_TICKS(10));
+     uint16_t current_pos = AX12_ReadPosition(DYNAMIXEL_TUBE_ID);
+     vTaskDelay(pdMS_TO_TICKS(10));
+     current_pos = AX12_ReadPosition(DYNAMIXEL_SYRINGE_ID);
+     vTaskDelay(pdMS_TO_TICKS(10));
+
+
 }
