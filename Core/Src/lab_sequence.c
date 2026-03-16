@@ -6,6 +6,7 @@
 #include "queue.h"
 #include "semphr.h"
 #include "task.h"
+#include <stdlib.h>
 // ... inne includy RTOS
 
 typedef enum
@@ -30,6 +31,15 @@ typedef enum
 #define BIT_MANUAL_MODE   (1 << 1)
 #define BIT_DRILL_LOWERED (1 << 2)
 #define BIT_START_AUTO    (1 << 3)
+
+// --- PARAMETRY MECHANICZNE REWOLWERÓW ---
+#define POS_SAFE_TUBE    1023 // (Ograniczono z 1024 do fizycznego limitu AX-12A)
+#define POS_SAFE_SYRINGE 600
+#define TUBE_BASE_POS    790 // Pozycja pierwszej probówki pod wiertłem
+#define TUBE_SPACING     123 // Offset 36 stopni (36 / 0.293 st/jednostkę = ~123)
+
+// Zmienna przechowująca numer aktualnej probówki (np. od 0 do 5)
+static uint8_t current_tube_index = 0;
 
 EventGroupHandle_t xSystemEvents;
 SemaphoreHandle_t xMotorPowerMutex;
@@ -143,6 +153,35 @@ extern QueueHandle_t xDynamixelQueue;
     }
 } */
 
+uint8_t WaitForServoPosition(uint8_t servo_id, uint16_t target_pos, uint32_t timeout_ms)
+{
+    uint32_t start_time = xTaskGetTickCount();
+    uint32_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+
+    while ((xTaskGetTickCount() - start_time) < timeout_ticks)
+    {
+
+        uint16_t current_pos = AX12_ReadPosition(servo_id);
+
+        if (current_pos != 0xFFFF)
+        { // Jeśli odczyt się udał
+            int16_t error = (int16_t)current_pos - (int16_t)target_pos;
+
+            // Tolerancja +/- 3 jednostki (~0.8 stopnia)
+            // Serwa prawie nigdy nie stają IDEALNIE na punkcie, zawsze lekko drgają.
+            if (abs(error) <= 3)
+            {
+                return 1; // Jesteśmy na miejscu!
+            }
+        }
+
+        // Zwalniamy procesor na 50ms, żeby inne taski (np. obsługa CAN) mogły działać
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    return 0; // Błąd - Timeout minął, serwo się zablokowało!
+}
+
 void vTaskLabSequence(void* pvParameters)
 {
     LabState_t currentState = LAB_STATE_IDLE;
@@ -216,26 +255,31 @@ void vTaskLabSequence(void* pvParameters)
                 SetDrillLoweringSpeed_MC34931(800, 2); // 2 = W GÓRĘ
             }
             break;
+
         case LAB_STATE_HOMING_REVOLVERS:
         {
-            DynamixelCmd_t moveCmd;
+            DynamixelCmd_t moveCmdTube, moveCmdSyr;
 
-            // 1. Wysyłamy dolny rewolwer (probówki) na pozycję bezpieczną
-            moveCmd.servo_id = DYNAMIXEL_TUBE_ID;
-            moveCmd.target_position = 0; // WSTAW TUTAJ BEZPIECZNY KĄT (np. 0 lub 512)
-            xQueueSend(xDynamixelQueue, &moveCmd, portMAX_DELAY);
+            moveCmdTube.servo_id = DYNAMIXEL_TUBE_ID;
+            moveCmdTube.target_position = POS_SAFE_TUBE;
+            xQueueSend(xDynamixelQueue, &moveCmdTube, portMAX_DELAY);
 
-            // 2. Wysyłamy górny rewolwer (strzykawki) na pozycję bezpieczną
-            moveCmd.servo_id = DYNAMIXEL_SYRINGE_ID;
-            moveCmd.target_position = 0; // WSTAW TUTAJ BEZPIECZNY KĄT
-            xQueueSend(xDynamixelQueue, &moveCmd, portMAX_DELAY);
+            moveCmdSyr.servo_id = DYNAMIXEL_SYRINGE_ID;
+            moveCmdSyr.target_position = POS_SAFE_SYRINGE;
+            xQueueSend(xDynamixelQueue, &moveCmdSyr, portMAX_DELAY);
 
-            // 3. Czekamy, aż serwa fizycznie dojadą na miejsce
-            // (Czas zależy od tego, jak daleko muszą wrócić, 2 sekundy to bezpieczny margines)
-            vTaskDelay(pdMS_TO_TICKS(2000));
+            // Czekamy na oba serwa!
+            uint8_t tube_ok = WaitForServoPosition(DYNAMIXEL_TUBE_ID, POS_SAFE_TUBE, 5000);
+            uint8_t syr_ok = WaitForServoPosition(DYNAMIXEL_SYRINGE_ID, POS_SAFE_SYRINGE, 5000);
 
-            // Rewolwery ustawione, droga wolna – można wiercić!
-            currentState = LAB_STATE_DRILLING;
+            if (tube_ok && syr_ok)
+            {
+                currentState = LAB_STATE_TUBE_POS;
+            }
+            else
+            {
+                currentState = LAB_STATE_IDLE; // Przerwij z powodu błędu
+            }
             break;
         }
 
@@ -304,16 +348,30 @@ void vTaskLabSequence(void* pvParameters)
         {
             DynamixelCmd_t moveCmd;
             moveCmd.servo_id = DYNAMIXEL_TUBE_ID;
-            moveCmd.target_position = 512; // Zmień na właściwą pozycję dla probówki
 
-            // Wrzucamy komendę do kolejki
+            uint16_t calc_pos = TUBE_BASE_POS - (current_tube_index * TUBE_SPACING);
+            if (calc_pos > 1023)
+                calc_pos = 1023;
+
+            moveCmd.target_position = calc_pos;
             xQueueSend(xDynamixelQueue, &moveCmd, portMAX_DELAY);
 
-            // Czekamy, aż serwo dojedzie na miejsce
-            // (Wersja prosta: opóźnienie czasowe. Wersja zaawansowana: odczytywanie statusu)
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            // INTELIGENTNE CZEKANIE (z maksymalnym timeoutem 5 sekund)
+            if (WaitForServoPosition(DYNAMIXEL_TUBE_ID, calc_pos, 5000))
+            {
+                // Serwo dojechało, kontynuujemy cykl
+                current_tube_index++;
 
-            currentState = LAB_STATE_FILL_TUBE;
+                currentState = LAB_STATE_FILL_TUBE;
+            }
+            else
+            {
+                // ERROR! Serwo zablokowane. Zatrzymujemy maszynę!
+                // Tutaj w przyszłości można wysłać komunikat po CAN do Bena
+                EmergencyStopMotors();
+                currentState = LAB_STATE_IDLE;
+            }
+
             break;
         }
 
@@ -378,6 +436,7 @@ void LabRTOS_Init(void)
 {
     xSystemEvents = xEventGroupCreate();
     xMotorPowerMutex = xSemaphoreCreateMutex();
+    xUartMutex = xSemaphoreCreateMutex();
 
     xDynamixelQueue = xQueueCreate(5, sizeof(DynamixelCmd_t));
 

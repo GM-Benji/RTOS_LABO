@@ -23,8 +23,9 @@ Projekt oprogramowania wbudowanego dla zrobotyzowanego laboratorium pobierające
 
 ### 4. Rewolwery i Strzykawki (Serwa Dynamixel AX-12A - Protokół 1.0)
 * **PA9 (USART1_TX):** Linia DATA (Single-Wire / Half-Duplex). Wymagany zewnętrzny rezystor Pull-up (~4.7kΩ - 10kΩ) do 5V. Baudrate: 1 000 000 bps.
-  * **ID 0x1E:** Dolny rewolwer (probówki)
-  * **ID 0x13:** Górny rewolwer (strzykawki/odczynniki)
+  * **ID 0x1E (30):** Dolny rewolwer (probówki). Baza: 790, Odstęp: 123 (36°). Pozycja bezpieczna: 1023.
+  * **ID 0x13 (19):** Górny rewolwer (strzykawki/odczynniki). Pozycja bezpieczna: 600.
+* *Uwaga sprzętowa:* Zaimplementowano programowe "pływające okno" odczytu oraz sprzętowe czyszczenie bufora UART (`__HAL_UART_CLEAR_OREFLAG`), aby wyeliminować zakłócenia (glitche) pojawiające się przy przełączaniu pinu w trybie Half-Duplex.
 
 ### 5. Wejścia sygnałowe (Czujniki i Przyciski)
 * **PB12:** Krańcówka wiertła `DRILL_HOME_SW` (GPIO Input + Pull-Up). Zewrzeć do GND w celu wyzwolenia.
@@ -37,9 +38,9 @@ Projekt oprogramowania wbudowanego dla zrobotyzowanego laboratorium pobierające
 Kod został podzielony na logiczne warstwy, oddzielające sprzęt od logiki operacyjnej:
 
 * `main.c`: Konfiguracja wygenerowana przez STM32CubeMX, inicjalizacja układów i start schedulera RTOS.
-* `motors.h` / `motors.c`: Warstwa abstrakcji sprzętu (HAL) dla silników DC. Obsługuje sprzętowe PWM, sprzętowy enkoder (wraz z wirtualnym 32-bitowym przepełnieniem w przerwaniu) oraz debouncing przycisków.
-* `dynamixel.h` / `dynamixel.c`: Niskopoziomowy sterownik dla serw AX-12A operujący na sprzętowym trybie Half-Duplex USART1.
-* `lab_sequence.h` / `lab_sequence.c`: Serce systemu. Zawiera zadania (Tasks) FreeRTOS, maszyny stanów, oraz mechanizmy IPC (Kolejki, Muteksy).
+* `motors.h` / `motors.c`: Warstwa abstrakcji sprzętu (HAL) dla silników DC. Obsługuje sprzętowe PWM, 32-bitowy enkoder programowy oraz debouncing przycisków.
+* `dynamixel.h` / `dynamixel.c`: Niskopoziomowy sterownik dla serw AX-12A. Realizuje zamkniętą pętlę sterowania (odczyt pozycji z rejestru `0x24`), spowolnienie ruchu (rejestr `0x20`) i zabezpiecza komunikację muteksem.
+* `lab_sequence.h` / `lab_sequence.c`: Serce systemu. Zawiera zadania (Tasks) FreeRTOS, maszyny stanów, oraz mechanizmy IPC.
 
 ---
 
@@ -48,39 +49,39 @@ Kod został podzielony na logiczne warstwy, oddzielające sprzęt od logiki oper
 System wykorzystuje natywne API FreeRTOS z następującymi mechanizmami:
 
 ### Zadania (Tasks)
-1. `vTaskLabSequence` (Priorytet: Normalny+2) - Główna maszyna stanów realizująca sekwencję (IDLE -> HOMING -> DRILLING -> ...).
-2. `vTaskDynamixel` (Priorytet: Normalny+3) - Task dedykowany do odbierania komend z kolejki i bezpiecznego wysyłania ramek UART do serw.
+1. `vTaskLabSequence` (Priorytet: Normalny+2) - Główna maszyna stanów realizująca cykl pracy laboratorium.
+2. `vTaskDynamixel` (Priorytet: Normalny+3) - Task odbierający komendy z kolejki i wysyłający ramki UART do serw (zabezpieczony przed ruchem przy opuszczonym wiertle).
 
 ### Bezpieczeństwo i Synchronizacja
-* **`xSystemEvents` (Event Group):** Przechowuje globalne flagi stanu systemu, m.in. `BIT_SCRAM_ACTIVE` (Natychmiastowe zatrzymanie maszyn) oraz `BIT_DRILL_LOWERED`.
-* **`xMotorPowerMutex` (Mutex):** Gwarantuje wzajemne wykluczanie pracy silnika opuszczania wiertła i silnika mieszadła (zapobiega fizycznym kolizjom i przeciążeniom zasilania).
-* **Blokada Dynamixeli:** Task `vTaskDynamixel` natywnie odrzuca komendy obrotu, jeśli flaga `BIT_DRILL_LOWERED` jest podniesiona, co chroni wiertło przed zderzeniem z rewolwerami.
-* **Debouncing Krańcówki:** Implementacja programowa (hamowanie przed potwierdzeniem stanu) w `vTaskLabSequence`.
+* **`xSystemEvents` (Event Group):** Przechowuje globalne flagi stanu systemu (`BIT_SCRAM_ACTIVE`, `BIT_DRILL_LOWERED`).
+* **`xMotorPowerMutex` (Mutex):** Gwarantuje wzajemne wykluczanie pracy silnika wiertła i silnika mieszadła.
+* **`xUartMutex` (Mutex):** Zapobiega kolizjom ramek na jednoprzewodowej magistrali UART (blokuje nadawanie komend z kolejki, gdy maszyna stanów odpytuje serwo o aktualną pozycję).
+* **Closed-Loop Dynamixel:** Maszyna stanów nie przechodzi do kolejnego kroku, dopóki fizycznie nie potwierdzi osiągnięcia zadanej pozycji przez serwa (z marginesem tolerancji i 5-sekundowym timeoutem).
 
 ---
 
 ## 🚀 Maszyna Stanów (Logika Operacyjna)
 
 Cykl pracy laboratorium przechodzi przez zdefiniowane stany (`LabState_t`):
-1. **IDLE:** Oczekiwanie na sygnał z pinu PB13 lub flagę CAN.
-2. **HOMING:** Dojazd wiertła w górę do momentu wciśnięcia krańcówki (PB12) z zabezpieczeniem przed drganiami styków. Reset enkodera.
-3. **HOMING_REVOLVERS:** Wyjazd rewolwerów na pozycje bezpieczne.
-4. **DRILLING:** Włączenie obrotów, zjazd w dół, i odczyt głębokości z 32-bitowego licznika enkodera.
-5. **RETRACT:** Wycofanie wiertła nad probówkę.
-6. **TUBE_POS:** *(W trakcje wdrażania)* Podjazd odpowiednią probówką na pozycję pod wiertłem.
-7. *Kolejne kroki: FILL_TUBE, REAGENT_POS, DOSING, STIRRER_POS, STIRRING, SPECTROMETER_POS, SPECTROMETER_FLASH...*
+1. **IDLE:** Oczekiwanie na sygnał z pinu PB13 (lub CAN).
+2. **HOMING:** Dojazd wiertła w górę do momentu wciśnięcia krańcówki (PB12). Reset enkodera.
+3. **HOMING_REVOLVERS:** Powolny wyjazd obu rewolwerów na pozycje bezpieczne (1023 i 600), aby uniknąć kolizji wiertła z probówkami.
+4. **DRILLING:** Włączenie obrotów CW i zjazd w dół na zadaną głębokość na podstawie enkodera.
+5. **RETRACT:** Wycofanie wiertła nad rewolwer.
+6. **TUBE_POS:** Podjazd dolnego rewolweru na pozycję wyliczoną ze wzoru (Baza 790 - Indeks * 123). Oczekiwanie na potwierdzenie sprzętowe osiągnięcia pozycji.
+7. **FILL_TUBE:** Zrzucanie gleby (obroty CCW przez 2 sekundy). Logika zakłada, że jeden zjazd wiertła wystarcza na napełnienie 2 probówek. System zapętla się z punktem 6 dla nieparzystych indeksów.
+8. *Kolejne kroki: REAGENT_POS, DOSING, STIRRER_POS, STIRRING, SPECTROMETER_POS, SPECTROMETER_FLASH...*
 
 ---
 
 ## 🛠️ Ważne notatki środowiskowe (STM32CubeMX)
 * FreeRTOS wdrożony metodą "Bare-Metal" (pominięcie CMSIS-V2 z CubeMX). Przerwania `SysTick`, `SVC` i `PendSV` są zmapowane sprzętowo w `FreeRTOSConfig.h`.
 * Zegar Timebase Source dla `HAL_Delay` ustawiony na **TIM2**.
-* Przerwania włączone dla `TIM2` (Timebase) oraz `TIM4` (Update/Overflow dla enkodera). Przerwania `SysTick` / `SVC` odznaczone w sekcji Code Generation (NVIC).
+* Przerwania włączone dla `TIM2` (Timebase) oraz `TIM4` (Update/Overflow dla enkodera).
 
 ---
 
 ## 📋 TODO (Następne kroki)
-- [ ] Kalibracja wartości na sprzęcie (głębokość z enkodera, bezpieczne kąty Dynamixeli).
 - [ ] Implementacja magistrali CAN.
-- [ ] Dokończenie stanów dozowania (obsługa pompek/elektrozaworów).
-- [ ] Konfiguracja sygnału błysku dla spektrometru.
+- [ ] Dokończenie stanów dozowania (obsługa pompek/elektrozaworów w `LAB_STATE_DOSING`).
+- [ ] Konfiguracja pinu wyzwalającego błysk dla spektrometru.

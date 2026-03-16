@@ -1,7 +1,8 @@
 #include "dynamixel.h"
 #include <stdlib.h>
 
-extern UART_HandleTypeDef huart1; // Zmienna z main.c/usart.c
+extern UART_HandleTypeDef huart1;    // Zmienna z main.c/usart.c
+SemaphoreHandle_t xUartMutex = NULL; // Definicja muteksa
 
 int8_t AX12_CalculateChecksum(uint8_t id, uint8_t len, uint8_t instruction, uint8_t* params, uint8_t params_len)
 {
@@ -16,10 +17,10 @@ int8_t AX12_CalculateChecksum(uint8_t id, uint8_t len, uint8_t instruction, uint
 void AX12_SendPacket(uint8_t id, uint8_t instruction, uint8_t* params, uint8_t params_len)
 {
     uint8_t buffer[20];
-    uint8_t len = params_len + 2; // N parametrów + 2 (Instr + Checksum) [cite: 170]
+    uint8_t len = params_len + 2;
 
     buffer[0] = 0xFF;
-    buffer[1] = 0xFF; // Start bytes [cite: 162]
+    buffer[1] = 0xFF;
     buffer[2] = id;
     buffer[3] = len;
     buffer[4] = instruction;
@@ -28,18 +29,91 @@ void AX12_SendPacket(uint8_t id, uint8_t instruction, uint8_t* params, uint8_t p
     {
         buffer[5 + i] = params[i];
     }
-
     buffer[5 + params_len] = AX12_CalculateChecksum(id, len, instruction, params, params_len);
 
-    // 1. Włącz nadajnik (STM32 przejmuje linię)
-    HAL_HalfDuplex_EnableTransmitter(&huart1);
+    // ZABEZPIECZENIE: Czekamy na dostęp do UART (max 100ms)
+    if (xUartMutex != NULL && xSemaphoreTake(xUartMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        HAL_HalfDuplex_EnableTransmitter(&huart1);
+        HAL_UART_Transmit(&huart1, buffer, 6 + params_len, 10);
+        HAL_HalfDuplex_EnableReceiver(&huart1);
 
-    // 2. Wyślij dane
-    HAL_UART_Transmit(&huart1, buffer, 6 + params_len, 10);
+        // Zwalniamy dostęp dla innych tasków
+        xSemaphoreGive(xUartMutex);
+    }
+}
 
-    // 3. Przełącz na odbiór (Zwolnij linię, aby serwo mogło odpowiedzieć - Status Packet)
-    // Jest to konieczne nawet jeśli nie czytamy od razu odpowiedzi, aby nie blokować linii
-    HAL_HalfDuplex_EnableReceiver(&huart1);
+uint16_t AX12_ReadPosition(uint8_t id)
+{
+    uint8_t tx_buffer[8];
+    uint8_t rx_buffer[16]; // Zwiększony bufor, by wchłonąć ewentualne "śmieci"
+    uint8_t rx_index = 0;
+
+    tx_buffer[0] = 0xFF;
+    tx_buffer[1] = 0xFF;
+    tx_buffer[2] = id;
+    tx_buffer[3] = 0x04;                  // Długość: Instruction(1) + Params(2) + Checksum(1)
+    tx_buffer[4] = INST_READ_DATA;        // 0x02
+    tx_buffer[5] = ADDR_PRESENT_POSITION; // 0x24 (Rejestr 36)
+    tx_buffer[6] = 0x02;                  // Chcemy odczytać 2 bajty (Low i High byte)
+    tx_buffer[7] = AX12_CalculateChecksum(id, 0x04, INST_READ_DATA, &tx_buffer[5], 2);
+
+    if (xUartMutex != NULL && xSemaphoreTake(xUartMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+
+        // 1. Nadawanie
+        HAL_HalfDuplex_EnableTransmitter(&huart1);
+        HAL_UART_Transmit(&huart1, tx_buffer, 8, 10);
+
+        // 2. Przełączenie na odbiór
+        HAL_HalfDuplex_EnableReceiver(&huart1);
+
+        // 3. HARDWARE FLUSH: Brutalne wyczyszczenie rejestru danych STM32
+        // z ewentualnych śmieci po przełączeniu pinu
+        __HAL_UART_CLEAR_OREFLAG(&huart1);             // Czyścimy flagę Overrun
+        volatile uint32_t dummy = huart1.Instance->SR; // Odczyt Status Register
+        dummy = huart1.Instance->DR;                   // Odczyt Data Register
+        (void)dummy;                                   // Unikanie warningu kompilatora
+
+        // 4. Odbieranie "Znak po Znaku" z oknem wyszukiwania
+        uint32_t start_time = HAL_GetTick();
+        while ((HAL_GetTick() - start_time) < 20)
+        { // Timeout 20ms
+
+            uint8_t byte;
+            // Odczytujemy jeden bajt (z minimalnym timeoutem)
+            if (HAL_UART_Receive(&huart1, &byte, 1, 1) == HAL_OK)
+            {
+                if (rx_index < sizeof(rx_buffer))
+                {
+                    rx_buffer[rx_index++] = byte;
+                }
+            }
+
+            // Jeśli mamy już minimum 8 bajtów, zaczynamy szukać ramki
+            if (rx_index >= 8)
+            {
+                // Skanujemy bufor w poszukiwaniu nagłówka (pływające okno)
+                for (int i = 0; i <= rx_index - 8; i++)
+                {
+                    if (rx_buffer[i] == 0xFF && rx_buffer[i + 1] == 0xFF && rx_buffer[i + 2] == id)
+                    {
+
+                        // Opcjonalnie: można tu sprawdzić Checksum, ale nagłówek + id zazwyczaj wystarczą
+                        uint16_t position = rx_buffer[i + 5] | (rx_buffer[i + 6] << 8);
+
+                        xSemaphoreGive(xUartMutex);
+                        return position; // Sukces!
+                    }
+                }
+            }
+        }
+
+        // Timeout minął, nie znaleziono ramki
+        xSemaphoreGive(xUartMutex);
+    }
+
+    return 0xFFFF; // Błąd muteksa lub timeout UART
 }
 
 void AX12_SetGoalPosition(uint8_t id, uint16_t position)
@@ -185,11 +259,29 @@ void AX12_SetMode_Joint(uint8_t id)
 
     AX12_SendPacket(id, INST_WRITE_DATA, params, 5);
 }
+
+void AX12_SetMovingSpeed(uint8_t id, uint16_t speed)
+{
+    if (speed > 1023)
+        speed = 1023;
+
+    uint8_t params[3];
+    params[0] = ADDR_MOVING_SPEED; // 0x20
+    params[1] = speed & 0xFF;
+    params[2] = (speed >> 8) & 0xFF;
+
+    AX12_SendPacket(id, INST_WRITE_DATA, params, 3);
+}
 // Dodajmy tylko prostą funkcję inicjalizacyjną, żeby upewnić się, że serwa są w trybie Joint (pozycjonowania)
 void AX12_Init(void)
 {
     AX12_SetMode_Joint(DYNAMIXEL_TUBE_ID);
     HAL_Delay(10);
     AX12_SetMode_Joint(DYNAMIXEL_SYRINGE_ID);
+    HAL_Delay(10);
+
+    AX12_SetMovingSpeed(DYNAMIXEL_TUBE_ID, 100);
+    HAL_Delay(10);
+    AX12_SetMovingSpeed(DYNAMIXEL_SYRINGE_ID, 100);
     HAL_Delay(10);
 }
