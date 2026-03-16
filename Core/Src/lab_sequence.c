@@ -33,8 +33,8 @@ typedef enum
 #define BIT_START_AUTO    (1 << 3)
 
 // --- PARAMETRY MECHANICZNE REWOLWERÓW ---
-#define POS_SAFE_TUBE    1023 // (Ograniczono z 1024 do fizycznego limitu AX-12A)
-#define POS_SAFE_SYRINGE 600
+#define POS_SAFE_TUBE    1023 // Bezpieczna pozycja dla rewolweru z probówkami (nie koliduje z wiertłem)
+#define POS_SAFE_SYRINGE 600 // Bezpieczna pozycja dla rewolweru ze strzykawką (nie koliduje z wiertłem)
 #define TUBE_BASE_POS    790 // Pozycja pierwszej probówki pod wiertłem
 #define TUBE_SPACING     123 // Offset 36 stopni (36 / 0.293 st/jednostkę = ~123)
 
@@ -54,104 +54,6 @@ typedef struct
 
 // Pamiętaj, żeby uchwyt do kolejki był widoczny globalnie w tym pliku
 extern QueueHandle_t xDynamixelQueue;
-
-// Usunięto zbędny: extern TIM_HandleTypeDef htim4;
-
-/* void vTaskLabSequence(void *pvParameters) {
-    LabState_t currentState = LAB_STATE_IDLE;
-
-    // LINIA DODANA DO TESTOWANIA: Wymuszenie startu sekwencji od razu po włączeniu zasilania
-    xEventGroupSetBits(xSystemEvents, BIT_START_AUTO);
-
-    for(;;) {
-        EventBits_t events = xEventGroupGetBits(xSystemEvents);
-
-        // 1. Obsługa SCRAM - najwyższy priorytet
-        if(events & BIT_SCRAM_ACTIVE) {
-            EmergencyStopMotors(); // Szybkie zerowanie PWM i wysłanie stop do Dynamixeli[cite: 3]
-            currentState = LAB_STATE_IDLE;
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-
-        // 2. Obsługa Manual Mode[cite: 1, 3]
-        if(events & BIT_MANUAL_MODE) {
-            // Task sekwencji pauzuje, sterowanie przejmuje vTaskCAN / vTaskManual[cite: 3]
-            currentState = LAB_STATE_IDLE;
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-
-        // 3. Maszyna Stanów Trybu Automatycznego
-        switch(currentState) {
-            case LAB_STATE_IDLE:
-                if(events & BIT_START_AUTO) {
-                    currentState = LAB_STATE_HOMING;
-                }
-                break;
-
-            case LAB_STATE_HOMING:
-                // Logika dojazdu wiertła do krańcówki[cite: 3]
-                if (IsDrillHomed()) {
-                    SetDrillLoweringSpeed_MC34931(0, 0); // Zatrzymaj silnik!
-                    ResetDrillEncoder(); // <--- Teraz to zadziała, bo dodaliśmy do motors.h
-                    xEventGroupClearBits(xSystemEvents, BIT_DRILL_LOWERED);
-                    currentState = LAB_STATE_DRILLING;
-                } else {
-                    SetDrillLoweringSpeed_MC34931(800, 2); // Jedź w górę (kierunek 2)
-                }
-                break;
-
-            case LAB_STATE_DRILLING:
-                // Pobranie muteksa, aby upewnić się, że mieszadło nie działa[cite: 3]
-                if(xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-
-                    xEventGroupSetBits(xSystemEvents, BIT_DRILL_LOWERED);
-
-                    if (IsDrillAtTargetDepth(15000)) {
-                        SetDrillLoweringSpeed_MC34931(0, 0); // Zatrzymanie
-                        xSemaphoreGive(xMotorPowerMutex);
-                        currentState = LAB_STATE_RETRACT;
-                    } else {
-                         // Wiertło kręci i opuszcza
-                         SetDrillSpinSpeed_Talon(80);
-                         SetDrillLoweringSpeed_MC34931(800, 1); // 1 = W DÓŁ
-                         xSemaphoreGive(xMotorPowerMutex); // Zawsze oddajemy mutex!
-                    }
-                }
-                break;
-
-            case LAB_STATE_RETRACT:
-                if (IsDrillHomed()) {
-                    SetDrillLoweringSpeed_MC34931(0, 0);
-                    xEventGroupClearBits(xSystemEvents, BIT_DRILL_LOWERED);
-                    currentState = LAB_STATE_TUBE_POS;
-                } else {
-                    SetDrillLoweringSpeed_MC34931(800, 2); // 2 = W GÓRĘ
-                }
-                break;
-
-            // (...) Reszta stanów logicznych
-
-            case LAB_STATE_STIRRING:
-                // Znów pobranie muteksa zabezpieczającego jednoczesną pracę wiertła i mieszadła[cite: 3]
-                if(xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    // Mieszanie przez określony czas[cite: 1, 3]
-                    SetStirrerSpeed_MC34931(500, 1); // Odpalenie mieszadła do testów
-                    vTaskDelay(pdMS_TO_TICKS(5000)); // np. 5 sekund[cite: 3]
-                    StopStirrer();
-                    xSemaphoreGive(xMotorPowerMutex);
-                    currentState = LAB_STATE_SPECTROMETER_POS;
-                }
-                break;
-
-            default:
-                currentState = LAB_STATE_IDLE;
-                break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(20)); // Czas na inne procesy[cite: 3]
-    }
-} */
 
 uint8_t WaitForServoPosition(uint8_t servo_id, uint16_t target_pos, uint32_t timeout_ms)
 {
@@ -274,7 +176,7 @@ void vTaskLabSequence(void* pvParameters)
 
             if (tube_ok && syr_ok)
             {
-                currentState = LAB_STATE_TUBE_POS;
+                currentState = LAB_STATE_DRILLING;
             }
             else
             {
@@ -360,7 +262,6 @@ void vTaskLabSequence(void* pvParameters)
             if (WaitForServoPosition(DYNAMIXEL_TUBE_ID, calc_pos, 5000))
             {
                 // Serwo dojechało, kontynuujemy cykl
-                current_tube_index++;
 
                 currentState = LAB_STATE_FILL_TUBE;
             }
@@ -372,6 +273,43 @@ void vTaskLabSequence(void* pvParameters)
                 currentState = LAB_STATE_IDLE;
             }
 
+            break;
+        }
+        case LAB_STATE_FILL_TUBE:
+        {
+            // Dla bezpieczeństwa pobieramy muteks
+            if (xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+
+                // 1. Zrzucanie gleby: obroty CCW (wartość dodatnia)
+                // Możesz tu wpisać odpowiednią moc, np. 80 lub 100
+                SetDrillSpinSpeed_Talon(80);
+
+                // 2. Czekamy równo 2 sekundy
+                vTaskDelay(pdMS_TO_TICKS(2000));
+
+                // 3. Zatrzymujemy wiertło
+                SetDrillSpinSpeed_Talon(0);
+
+                xSemaphoreGive(xMotorPowerMutex);
+
+                // 4. Inkrementujemy licznik napełnionych probówek
+                current_tube_index++;
+
+                // Logika: 1 odwiert = 2 probówki
+                if (current_tube_index % 2 != 0)
+                {
+                    // Napełniliśmy nieparzystą liczbę probówek (np. pierwszą z pary)
+                    // Wracamy do obrotu rewolwerem pod kolejną probówkę
+                    currentState = LAB_STATE_TUBE_POS;
+                }
+                else
+                {
+                    // Napełniliśmy parzystą liczbę (np. drugą z pary)
+                    // Gleba się skończyła. Przechodzimy do dozowania odczynników!
+                    currentState = LAB_STATE_IDLE;
+                }
+            }
             break;
         }
 

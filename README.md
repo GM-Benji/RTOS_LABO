@@ -24,7 +24,7 @@ Projekt oprogramowania wbudowanego dla zrobotyzowanego laboratorium pobierające
 ### 4. Rewolwery i Strzykawki (Serwa Dynamixel AX-12A - Protokół 1.0)
 * **PA9 (USART1_TX):** Linia DATA (Single-Wire / Half-Duplex). Wymagany zewnętrzny rezystor Pull-up (~4.7kΩ - 10kΩ) do 5V. Baudrate: 1 000 000 bps.
   * **ID 0x1E (30):** Dolny rewolwer (probówki). Baza: 790, Odstęp: 123 (36°). Pozycja bezpieczna: 1023.
-  * **ID 0x13 (19):** Górny rewolwer (strzykawki/odczynniki). Pozycja bezpieczna: 600.
+  * **ID 0x01 (01):** Górny rewolwer (strzykawki/odczynniki). Pozycja bezpieczna: 600.
 * *Uwaga sprzętowa:* Zaimplementowano programowe "pływające okno" odczytu oraz sprzętowe czyszczenie bufora UART (`__HAL_UART_CLEAR_OREFLAG`), aby wyeliminować zakłócenia (glitche) pojawiające się przy przełączaniu pinu w trybie Half-Duplex.
 
 ### 5. Wejścia sygnałowe (Czujniki i Przyciski)
