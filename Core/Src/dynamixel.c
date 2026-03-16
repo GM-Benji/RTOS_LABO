@@ -276,12 +276,12 @@ void AX12_SetMovingSpeed(uint8_t id, uint16_t speed)
 void AX12_Init(void)
 {
     AX12_SetMode_Joint(DYNAMIXEL_TUBE_ID);
-    HAL_Delay(10);
+    vTaskDelay(pdMS_TO_TICKS(10));
     AX12_SetMode_Joint(DYNAMIXEL_SYRINGE_ID);
-    HAL_Delay(10);
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     AX12_SetMovingSpeed(DYNAMIXEL_TUBE_ID, 100);
-    HAL_Delay(10);
+    vTaskDelay(pdMS_TO_TICKS(10));
     AX12_SetMovingSpeed(DYNAMIXEL_SYRINGE_ID, 100);
-    HAL_Delay(10);
+    vTaskDelay(pdMS_TO_TICKS(10));
 }

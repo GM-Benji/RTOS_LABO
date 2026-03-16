@@ -39,7 +39,7 @@ typedef enum
 #define TUBE_SPACING     123 // Offset 36 stopni (36 / 0.293 st/jednostkę = ~123)
 
 // Zmienna przechowująca numer aktualnej probówki (np. od 0 do 5)
-static uint8_t current_tube_index = 0;
+static uint8_t current_tube_index = 6;
 
 EventGroupHandle_t xSystemEvents;
 SemaphoreHandle_t xMotorPowerMutex;
@@ -176,7 +176,7 @@ void vTaskLabSequence(void* pvParameters)
 
             if (tube_ok && syr_ok)
             {
-                currentState = LAB_STATE_DRILLING;
+                currentState = LAB_STATE_TUBE_POS; // Przechodzimy do kolejnego stanu
             }
             else
             {
@@ -283,7 +283,7 @@ void vTaskLabSequence(void* pvParameters)
 
                 // 1. Zrzucanie gleby: obroty CCW (wartość dodatnia)
                 // Możesz tu wpisać odpowiednią moc, np. 80 lub 100
-                SetDrillSpinSpeed_Talon(80);
+                //SetDrillSpinSpeed_Talon(80);
 
                 // 2. Czekamy równo 2 sekundy
                 vTaskDelay(pdMS_TO_TICKS(2000));
@@ -294,7 +294,7 @@ void vTaskLabSequence(void* pvParameters)
                 xSemaphoreGive(xMotorPowerMutex);
 
                 // 4. Inkrementujemy licznik napełnionych probówek
-                current_tube_index++;
+                current_tube_index--;
 
                 // Logika: 1 odwiert = 2 probówki
                 if (current_tube_index % 2 != 0)
@@ -337,6 +337,7 @@ void vTaskLabSequence(void* pvParameters)
 
 void vTaskDynamixel(void* pvParameters)
 {
+    AX12_Init();
     DynamixelCmd_t currentCmd;
 
     for (;;)

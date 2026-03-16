@@ -109,7 +109,7 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 // Tworzenie zadania (Czyste API FreeRTOS zamiast osThreadCreate)
-  AX12_Init();
+  
   MotorsControl_Init();
   LabRTOS_Init();
 
