@@ -15,6 +15,6 @@ void SetStirrerSpeed_MC34931(uint16_t speed_pwm, uint8_t direction);
 uint8_t IsDrillHomed(void);
 void ResetDrillEncoder(void); // <--- DODANE
 uint8_t IsStartSwitchPressed(void);
-void DrillEncoder_OverflowCallback(TIM_HandleTypeDef *htim);
+void DrillEncoder_OverflowCallback(TIM_HandleTypeDef* htim);
 
 #endif
