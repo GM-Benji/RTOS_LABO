@@ -1,5 +1,6 @@
 #include "lab_sequence.h"
 #include "FreeRTOS.h"
+#include "can.h"
 #include "dynamixel.h"
 #include "event_groups.h"
 #include "motors.h"
@@ -7,24 +8,23 @@
 #include "semphr.h"
 #include "task.h"
 #include <stdlib.h>
-// ... inne includy RTOS
 
 typedef enum
 {
     LAB_STATE_IDLE,
-    LAB_STATE_HOMING, // zerowanie wiertła (krańcówka)[cite: 1, 3]
+    LAB_STATE_HOMING,
     LAB_STATE_HOMING_REVOLVERS,
-    LAB_STATE_DRILLING,           // odwiert na zadaną głębokość[cite: 1, 3]
-    LAB_STATE_RETRACT,            // powrót nad probówkę[cite: 1, 3]
-    LAB_STATE_TUBE_POS,           // podjazd dolnym rewolwerem[cite: 1, 3]
-    LAB_STATE_FILL_TUBE,          // procedura napełniania (wiertło -> rewolwer -> wiertło)[cite: 1, 3]
-    LAB_STATE_REAGENT_POS,        // podjazd odpowiednich odczynników[cite: 1, 3]
-    LAB_STATE_DOSING,             // dozowniki dozują kolejne odczynniki[cite: 1, 3]
-    LAB_STATE_STIRRER_POS,        // podjazd pod mieszadło[cite: 1, 3]
-    LAB_STATE_STIRRING,           // mieszanie przez określony czas z określoną szybkością[cite: 1, 3]
-    LAB_STATE_SPECTROMETER_POS,   // podjazd pod spektrometr[cite: 1, 3]
-    LAB_STATE_SPECTROMETER_FLASH, // błysk ~1s[cite: 1, 3]
-    LAB_STATE_RESET_READY         // zerowanie do stanu gotowości do odwiertu[cite: 1, 3]
+    LAB_STATE_DRILLING,
+    LAB_STATE_RETRACT,
+    LAB_STATE_TUBE_POS,
+    LAB_STATE_FILL_TUBE,
+    LAB_STATE_REAGENT_POS,
+    LAB_STATE_DOSING,
+    LAB_STATE_STIRRER_POS,
+    LAB_STATE_STIRRING,
+    LAB_STATE_SPECTROMETER_POS,
+    LAB_STATE_SPECTROMETER_FLASH,
+    LAB_STATE_RESET_READY
 } LabState_t;
 
 #define BIT_SCRAM_ACTIVE  (1 << 0)
@@ -33,33 +33,65 @@ typedef enum
 #define BIT_START_AUTO    (1 << 3)
 
 // --- PARAMETRY MECHANICZNE REWOLWERÓW ---
-#define POS_SAFE_TUBE    1023 // Bezpieczna pozycja dla rewolweru z probówkami (nie koliduje z wiertłem)
-#define POS_SAFE_SYRINGE 600  // Bezpieczna pozycja dla rewolweru ze strzykawką (nie koliduje z wiertłem)
-#define TUBE_BASE_POS    790  // Pozycja pierwszej probówki pod wiertłem
-#define TUBE_SPACING     123  // Offset 36 stopni (36 / 0.293 st/jednostkę = ~123)
+#define POS_SAFE_TUBE    1023
+#define POS_SAFE_SYRINGE 600
+#define TUBE_BASE_POS    790
+#define TUBE_SPACING     123
 
-#define SYRINGE_BASE_POS 485 // Pozycja pierwszej strzykawki
+#define SYRINGE_BASE_POS 485
 #define SYRINGE_SPACING  132
 
-#define TUBE_STIR_POS 514 // Pozycja pierwszej probówki nad mieszadlem
+#define TUBE_STIR_POS 514
 
-// Zmienna przechowująca numer aktualnej probówki (np. od 0 do 5)
-static uint8_t current_tube_index = 6;
-static uint8_t current_syringe_index = 4;
+#define TUBE_SPECTRO_POS 750 // Pozycja pierwszej probówki pod spektrometrem
+
+// --- NOWA LOGIKA OMIJANIA PROBÓWKI 1 ---
+// Fizyczna kolejność gniazd (6 kroków) - zauważ brak jedynki
+// Omijamy fizyczne gniazda 1 oraz 3.
+// Zostają nam dwie idealne pary robocze!
+const uint8_t TUBE_SEQUENCE[] = {6, 4, 2, 0};
+
+static uint8_t current_seq_idx = 0; // Licznik kroków wiercenia (0-5)
+static uint8_t current_syringe_index = 0;
+static uint8_t active_dosing_seq_idx = 0;       // Krok dla dozownika
+static uint8_t tubes_dosed_in_this_cycle = 0;   // Licznik (0-2)
+static uint8_t active_stir_seq_idx = 0;         // Krok dla mieszadła
+static uint8_t tubes_stirred_in_this_cycle = 0; // Licznik wymieszanych probówek (0-2)
+static uint8_t active_spectro_seq_idx = 0;      // Krok dla spektrometru
+static uint8_t tubes_spectro_in_this_cycle = 0; // Licznik zbadanych probówek (0-2)
 
 EventGroupHandle_t xSystemEvents;
 SemaphoreHandle_t xMotorPowerMutex;
+extern SemaphoreHandle_t xUartMutex;
 QueueHandle_t xDynamixelQueue;
 
-// Struktura komendy dla serwa
+
 typedef struct
 {
     uint8_t servo_id;
     uint16_t target_position;
 } DynamixelCmd_t;
 
-// Pamiętaj, żeby uchwyt do kolejki był widoczny globalnie w tym pliku
-extern QueueHandle_t xDynamixelQueue;
+void Spectrometer_SetBulb(uint8_t state)
+{
+    CAN_TxHeaderTypeDef TxHeader;
+    uint32_t TxMailbox;
+    uint8_t TxData[1];
+
+    // Konfiguracja ramki zgodnie z Twoim odbiornikiem
+    TxHeader.StdId = 0x98;
+    TxHeader.ExtId = 0;
+    TxHeader.RTR = CAN_RTR_DATA;
+    TxHeader.IDE = CAN_ID_STD;
+    TxHeader.DLC = 1; // Wysyłamy tylko 1 bajt
+    TxHeader.TransmitGlobalTime = DISABLE;
+
+    TxData[0] = state ? 1 : 0; // 1 = włącz, 0 = wyłącz
+
+    // Wysłanie ramki na magistralę (zmień hcan1 na hcan jeśli tak się u Ciebie nazywa)
+    extern CAN_HandleTypeDef hcan;
+    HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox);
+}
 
 uint8_t WaitForServoPosition(uint8_t servo_id, uint16_t target_pos, uint32_t timeout_ms)
 {
@@ -68,41 +100,31 @@ uint8_t WaitForServoPosition(uint8_t servo_id, uint16_t target_pos, uint32_t tim
 
     while ((xTaskGetTickCount() - start_time) < timeout_ticks)
     {
-
         uint16_t current_pos = AX12_ReadPosition(servo_id);
 
         if (current_pos != 0xFFFF)
-        { // Jeśli odczyt się udał
+        {
             int16_t error = (int16_t)current_pos - (int16_t)target_pos;
-
-            // Tolerancja +/- 3 jednostki (~0.8 stopnia)
-            // Serwa prawie nigdy nie stają IDEALNIE na punkcie, zawsze lekko drgają.
             if (abs(error) <= 3)
             {
-                return 1; // Jesteśmy na miejscu!
+                return 1;
             }
         }
-
-        // Zwalniamy procesor na 50ms, żeby inne taski (np. obsługa CAN) mogły działać
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-
-    return 0; // Błąd - Timeout minął, serwo się zablokowało!
+    return 0;
 }
 
 void vTaskLabSequence(void* pvParameters)
 {
     LabState_t currentState = LAB_STATE_IDLE;
-
-    // --- KROK TESTOWY 1: Wymuszenie startu od razu po uruchomieniu ---
-    // Maszyna stanów od razu przeskoczy do LAB_STATE_HOMING
-    // xEventGroupSetBits(xSystemEvents, BIT_START_AUTO);
+    LabState_t prevState = LAB_STATE_RESET_READY;
+    uint8_t state_entry = 0;
 
     for (;;)
     {
         EventBits_t events = xEventGroupGetBits(xSystemEvents);
 
-        // 1. Obsługa SCRAM (Odcięcie awaryjne)
         if (events & BIT_SCRAM_ACTIVE)
         {
             EmergencyStopMotors();
@@ -111,7 +133,6 @@ void vTaskLabSequence(void* pvParameters)
             continue;
         }
 
-        // 2. Obsługa Manual Mode
         if (events & BIT_MANUAL_MODE)
         {
             currentState = LAB_STATE_IDLE;
@@ -119,40 +140,46 @@ void vTaskLabSequence(void* pvParameters)
             continue;
         }
 
-        // 3. Maszyna Stanów Trybu Automatycznego
+        // Ustalenie flagi wejścia do stanu
+        if (currentState != prevState)
+        {
+            state_entry = 1;
+            prevState = currentState;
+        }
+        else
+        {
+            state_entry = 0;
+        }
+
         switch (currentState)
         {
         case LAB_STATE_IDLE:
-            // 1. Sprawdzenie fizycznego przycisku S_SWITCH (PB13)
             if (IsStartSwitchPressed())
             {
-                // Prosty debouncing (eliminacja drgań styków mechanicznych)
                 vTaskDelay(pdMS_TO_TICKS(50));
                 if (IsStartSwitchPressed())
                 {
                     currentState = LAB_STATE_HOMING;
                 }
             }
-            // 2. Start z magistrali CAN (jeśli flaga ustawiona np. przez Bena z komputera)
             else if (events & BIT_START_AUTO)
             {
-                xEventGroupClearBits(xSystemEvents, BIT_START_AUTO); // Czyścimy flagę, żeby nie wyzwalała się podwójnie
+                xEventGroupClearBits(xSystemEvents, BIT_START_AUTO);
                 currentState = LAB_STATE_HOMING;
             }
-            current_tube_index = 6;
-            current_syringe_index = 4;
             break;
 
         case LAB_STATE_HOMING:
+            if (state_entry)
+            {
+                SetDrillLoweringSpeed_MC34931(800, 2);
+            }
+
             if (IsDrillHomed())
             {
-                // 1. BEZPIECZEŃSTWO: Natychmiast zatrzymaj silnik opuszczania!
                 SetDrillLoweringSpeed_MC34931(0, 0);
-
-                // 2. DEBOUNCE: Poczekaj 50ms na ustabilizowanie mechaniczne styków
                 vTaskDelay(pdMS_TO_TICKS(100));
 
-                // 3. WERYFIKACJA: Sprawdź, czy krańcówka nadal jest wciśnięta
                 if (IsDrillHomed())
                 {
                     ResetDrillEncoder();
@@ -160,218 +187,353 @@ void vTaskLabSequence(void* pvParameters)
                     currentState = LAB_STATE_HOMING_REVOLVERS;
                 }
             }
-            else
-            {
-                SetDrillLoweringSpeed_MC34931(800, 2); // 2 = W GÓRĘ
-            }
             break;
 
         case LAB_STATE_HOMING_REVOLVERS:
         {
-            DynamixelCmd_t moveCmdTube, moveCmdSyr;
-
-            moveCmdTube.servo_id = DYNAMIXEL_TUBE_ID;
-            moveCmdTube.target_position = POS_SAFE_TUBE;
-            xQueueSend(xDynamixelQueue, &moveCmdTube, portMAX_DELAY);
-
-            moveCmdSyr.servo_id = DYNAMIXEL_SYRINGE_ID;
-            moveCmdSyr.target_position = POS_SAFE_SYRINGE;
-            xQueueSend(xDynamixelQueue, &moveCmdSyr, portMAX_DELAY);
-
-            // Czekamy na oba serwa!
-            uint8_t tube_ok = WaitForServoPosition(DYNAMIXEL_TUBE_ID, POS_SAFE_TUBE, 5000);
-            uint8_t syr_ok = WaitForServoPosition(DYNAMIXEL_SYRINGE_ID, POS_SAFE_SYRINGE, 5000);
-
-            if (tube_ok && syr_ok)
+            if (state_entry)
             {
-                currentState = LAB_STATE_TUBE_POS; // Przechodzimy do kolejnego stanu
+                DynamixelCmd_t moveCmdTube = {DYNAMIXEL_TUBE_ID, POS_SAFE_TUBE};
+                DynamixelCmd_t moveCmdSyr = {DYNAMIXEL_SYRINGE_ID, POS_SAFE_SYRINGE};
+                xQueueSend(xDynamixelQueue, &moveCmdTube, portMAX_DELAY);
+                xQueueSend(xDynamixelQueue, &moveCmdSyr, portMAX_DELAY);
+            }
+
+            if (WaitForServoPosition(DYNAMIXEL_TUBE_ID, POS_SAFE_TUBE, 5000) &&
+                WaitForServoPosition(DYNAMIXEL_SYRINGE_ID, POS_SAFE_SYRINGE, 5000))
+            {
+                currentState = LAB_STATE_DRILLING;
             }
             else
             {
-                currentState = LAB_STATE_IDLE; // Przerwij z powodu błędu
+                currentState = LAB_STATE_IDLE;
             }
             break;
         }
 
         case LAB_STATE_DRILLING:
-            if (xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            if (state_entry)
             {
-                xEventGroupSetBits(xSystemEvents, BIT_DRILL_LOWERED);
+                if (xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+                {
+                    xEventGroupSetBits(xSystemEvents, BIT_DRILL_LOWERED);
+                    SetDrillSpinSpeed_Talon(-80);
+                    SetDrillLoweringSpeed_MC34931(800, 1);
+                    xSemaphoreGive(xMotorPowerMutex);
+                }
+            }
 
-                // UWAGA: Ponieważ nie mamy fizycznie podpiętego enkodera
-                // warunek (pozycja > 15000) nigdy nie zostanie spełniony.
-                // Maszyna zablokuje się w tym stanie, co jest idealne do pomiarów!
-                if (IsDrillAtTargetDepth(4 * 65535))
+            if (IsDrillAtTargetDepth(/* 4 */ 1 * 65535))
+            {
+                if (xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE)
                 {
                     SetDrillLoweringSpeed_MC34931(0, 0);
-                    // SetDrillSpinSpeed_Talon(0);
-                    xSemaphoreGive(xMotorPowerMutex);
-                    currentState = LAB_STATE_RETRACT;
-                }
-                else
-                {
-                    // POMIAR 1: PB0 powinien mieć PWM 80% (ok. 2.6V), PB1 ma 0V.
-                    // POMIAR 2: PB14 (Talon) wygeneruje sygnał RC (na multimetrze to ułamek wolta)
-                    SetDrillSpinSpeed_Talon(-80);          // Kręcenie (Talon)
-                    SetDrillLoweringSpeed_MC34931(800, 1); // 1 = W DÓŁ (MC34931)
                     xSemaphoreGive(xMotorPowerMutex);
                 }
+                currentState = LAB_STATE_RETRACT;
             }
             break;
 
         case LAB_STATE_RETRACT:
+            if (state_entry)
+            {
+                SetDrillLoweringSpeed_MC34931(800, 2);
+            }
+
             if (IsDrillHomed())
             {
-                // 1. BEZPIECZEŃSTWO: Natychmiast zatrzymaj silnik
                 SetDrillLoweringSpeed_MC34931(0, 0);
                 SetDrillSpinSpeed_Talon(0);
-
-                // 2. DEBOUNCE: 50ms przerwy
                 vTaskDelay(pdMS_TO_TICKS(100));
 
-                // 3. WERYFIKACJA
                 if (IsDrillHomed())
                 {
                     xEventGroupClearBits(xSystemEvents, BIT_DRILL_LOWERED);
                     currentState = LAB_STATE_TUBE_POS;
                 }
             }
-            else
-            {
-                SetDrillLoweringSpeed_MC34931(800, 2); // 2 = W GÓRĘ
-            }
-            break;
-
-        case LAB_STATE_STIRRING:
-            if (xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE)
-            {
-                // POMIAR: PA6 lub PA7 wygeneruje PWM 50%
-                SetStirrerSpeed_MC34931(100, 1);
-                vTaskDelay(pdMS_TO_TICKS(5000)); // Mieszaj przez 5 sekund
-                StopStirrer();
-                xSemaphoreGive(xMotorPowerMutex);
-                currentState = LAB_STATE_SPECTROMETER_POS;
-            }
             break;
 
         case LAB_STATE_TUBE_POS:
         {
-            DynamixelCmd_t moveCmd;
-            moveCmd.servo_id = DYNAMIXEL_TUBE_ID;
+            // ODCZYT FIZYCZNEJ PROBÓWKI Z TABLICY
+            uint8_t physical_tube = TUBE_SEQUENCE[current_seq_idx];
+            uint16_t calc_pos = TUBE_BASE_POS - (physical_tube * TUBE_SPACING);
 
-            uint16_t calc_pos = TUBE_BASE_POS - (current_tube_index * TUBE_SPACING);
             if (calc_pos > 1023)
                 calc_pos = 1023;
 
-            moveCmd.target_position = calc_pos;
-            xQueueSend(xDynamixelQueue, &moveCmd, portMAX_DELAY);
+            if (state_entry)
+            {
+                DynamixelCmd_t moveCmd = {DYNAMIXEL_TUBE_ID, calc_pos};
+                xQueueSend(xDynamixelQueue, &moveCmd, portMAX_DELAY);
+            }
 
-            // INTELIGENTNE CZEKANIE (z maksymalnym timeoutem 5 sekund)
             if (WaitForServoPosition(DYNAMIXEL_TUBE_ID, calc_pos, 5000))
             {
-                // Serwo dojechało, kontynuujemy cykl
-
                 currentState = LAB_STATE_FILL_TUBE;
             }
             else
             {
-                // ERROR! Serwo zablokowane. Zatrzymujemy maszynę!
-                // Tutaj w przyszłości można wysłać komunikat po CAN do Bena
                 EmergencyStopMotors();
                 currentState = LAB_STATE_IDLE;
             }
-
             break;
         }
+
         case LAB_STATE_FILL_TUBE:
         {
-            // Dla bezpieczeństwa pobieramy muteks
+            // Bezpieczne operowanie Mutexem
             if (xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE)
             {
-
-                // 1. Zrzucanie gleby: obroty CCW (wartość dodatnia)
-                // Możesz tu wpisać odpowiednią moc, np. 80 lub 100
-                // SetDrillSpinSpeed_Talon(80);
-
-                // 2. Czekamy równo 2 sekundy
-                vTaskDelay(pdMS_TO_TICKS(2000));
-
-                // 3. Zatrzymujemy wiertło
-                SetDrillSpinSpeed_Talon(0);
-
+                SetDrillSpinSpeed_Talon(80);
                 xSemaphoreGive(xMotorPowerMutex);
+            }
 
-                // 4. Inkrementujemy licznik napełnionych probówek
-                current_tube_index--;
+            vTaskDelay(pdMS_TO_TICKS(2000));
 
-                // Logika: 1 odwiert = 2 probówki
-                if (current_tube_index % 2 != 0 && current_tube_index > 0)
-                {
-                    // Napełniliśmy nieparzystą liczbę probówek (np. pierwszą z pary)
-                    // Wracamy do obrotu rewolwerem pod kolejną probówkę
-                    currentState = LAB_STATE_TUBE_POS;
-                }
-                else
-                {
-                    // Napełniliśmy parzystą liczbę (np. drugą z pary)
-                    // Gleba się skończyła. Przechodzimy do dozowania odczynników!
-                    currentState = LAB_STATE_REAGENT_POS;
-                }
+            if (xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                SetDrillSpinSpeed_Talon(0);
+                xSemaphoreGive(xMotorPowerMutex);
+            }
+
+            // Przechodzimy do następnego indeksu sekwencji
+            current_seq_idx++;
+
+            // Logika parowania (1 odwiert = 2 probówki)
+            if (current_seq_idx % 2 != 0 && current_seq_idx > 0)
+            {
+                currentState = LAB_STATE_TUBE_POS;
+            }
+            else
+            {
+                active_dosing_seq_idx = current_seq_idx - 2;
+                tubes_dosed_in_this_cycle = 0;
+                current_syringe_index = 0;
+                currentState = LAB_STATE_REAGENT_POS;
             }
             break;
         }
-
-            // (...) (Tutaj będą inne stany, np. napełnianie, i po nim jazda do rewolweru z chemią)
 
         case LAB_STATE_REAGENT_POS:
         {
-            DynamixelCmd_t moveCmd;
-            moveCmd.servo_id = DYNAMIXEL_TUBE_ID;
+            // Tłumaczymy krok maszyny na fizyczną pozycję gniazda
+            uint8_t physical_tube = TUBE_SEQUENCE[active_dosing_seq_idx];
+            int16_t target_tube_pos = TUBE_STIR_POS + ((6 - physical_tube) * TUBE_SPACING);
 
-            uint16_t calc_pos = TUBE_STIR_POS;
+            // Poprawka dla probówki 0 (karuzela obróci się za daleko i przebije 1023)
+            // Zdejmujemy pełny obrót (ok. 1230 jednostek karuzeli)
+            if (target_tube_pos > 1023)
+                target_tube_pos -= 1230;
+            if (target_tube_pos < 0)
+                target_tube_pos = 0;
+            if (target_tube_pos > 1023)
+                target_tube_pos = 1023;
 
-            moveCmd.target_position = calc_pos;
-            xQueueSend(xDynamixelQueue, &moveCmd, portMAX_DELAY);
+            int16_t target_syr_pos = SYRINGE_BASE_POS + (current_syringe_index * SYRINGE_SPACING);
+            if (target_syr_pos < 0)
+                target_syr_pos = 0;
+            if (target_syr_pos > 1023)
+                target_syr_pos = 1023;
 
-            // INTELIGENTNE CZEKANIE (z maksymalnym timeoutem 5 sekund)
-            if (WaitForServoPosition(DYNAMIXEL_TUBE_ID, calc_pos, 5000))
+            if (state_entry)
             {
-                // Serwo dojechało, kontynuujemy cykl
+                DynamixelCmd_t moveCmdTube = {DYNAMIXEL_TUBE_ID, (uint16_t)target_tube_pos};
+                DynamixelCmd_t moveCmdSyr = {DYNAMIXEL_SYRINGE_ID, (uint16_t)target_syr_pos};
+                xQueueSend(xDynamixelQueue, &moveCmdTube, portMAX_DELAY);
+                xQueueSend(xDynamixelQueue, &moveCmdSyr, portMAX_DELAY);
+            }
 
-                currentState = LAB_STATE_FILL_TUBE;
+            if (WaitForServoPosition(DYNAMIXEL_TUBE_ID, (uint16_t)target_tube_pos, 5000) &&
+                WaitForServoPosition(DYNAMIXEL_SYRINGE_ID, (uint16_t)target_syr_pos, 5000))
+            {
+                currentState = LAB_STATE_DOSING;
             }
             else
             {
-                // ERROR! Serwo zablokowane. Zatrzymujemy maszynę!
-                // Tutaj w przyszłości można wysłać komunikat po CAN do Bena
                 EmergencyStopMotors();
                 currentState = LAB_STATE_IDLE;
             }
-            //DynamixelCmd_t moveCmd;
-            moveCmd.servo_id = DYNAMIXEL_SYRINGE_ID;
-            calc_pos = SYRINGE_BASE_POS - (current_syringe_index * SYRINGE_SPACING);
-            moveCmd.target_position = calc_pos; // Zmień na właściwą pozycję dla strzykawki
-
-            xQueueSend(xDynamixelQueue, &moveCmd, portMAX_DELAY);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-
-            currentState = LAB_STATE_DOSING;
             break;
         }
+
         case LAB_STATE_DOSING:
         {
             vTaskDelay(pdMS_TO_TICKS(500));
-            if (current_syringe_index)
+
+            current_syringe_index++;
+
+            if (current_syringe_index % 2 != 0)
             {
                 currentState = LAB_STATE_REAGENT_POS;
-                current_syringe_index--;
             }
             else
             {
+                tubes_dosed_in_this_cycle++;
+
+                if (tubes_dosed_in_this_cycle < 2)
+                {
+                    active_dosing_seq_idx++;
+                    currentState = LAB_STATE_REAGENT_POS;
+                }
+                else
+                {
+                    // Koniec dozowania obu probówek.
+                    // Przygotowujemy się do mieszania - wracamy do pierwszej probówki z pary!
+                    active_stir_seq_idx = current_seq_idx - 2;
+                    tubes_stirred_in_this_cycle = 0;
+                    currentState = LAB_STATE_STIRRER_POS;
+                }
+            }
+            break;
+        }
+
+        case LAB_STATE_STIRRER_POS:
+        {
+            // Pozycja mieszadła to to samo miejsce co dozowania,
+            // więc korzystamy z tej samej bazy (TUBE_STIR_POS).
+            uint8_t physical_tube = TUBE_SEQUENCE[active_stir_seq_idx];
+            int16_t target_tube_pos = TUBE_STIR_POS + ((6 - physical_tube) * TUBE_SPACING);
+
+            if (target_tube_pos > 1023)
+                target_tube_pos -= 1230;
+            if (target_tube_pos < 0)
+                target_tube_pos = 0;
+            if (target_tube_pos > 1023)
+                target_tube_pos = 1023;
+
+            if (state_entry)
+            {
+                // Wysyłamy komendę tylko do dolnego rewolweru. Górny (strzykawki) stoi w miejscu.
+                DynamixelCmd_t moveCmdTube = {DYNAMIXEL_TUBE_ID, (uint16_t)target_tube_pos};
+                xQueueSend(xDynamixelQueue, &moveCmdTube, portMAX_DELAY);
+            }
+
+            if (WaitForServoPosition(DYNAMIXEL_TUBE_ID, (uint16_t)target_tube_pos, 5000))
+            {
+                currentState = LAB_STATE_STIRRING;
+            }
+            else
+            {
+                EmergencyStopMotors();
                 currentState = LAB_STATE_IDLE;
             }
             break;
         }
+
+        case LAB_STATE_STIRRING:
+        {
+            if (state_entry)
+            {
+                if (xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+                {
+                    // Uruchamiamy mieszadło
+                    SetStirrerSpeed_MC34931(100, 1);
+                    xSemaphoreGive(xMotorPowerMutex);
+                }
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(5000)); // Czas mieszania jednej probówki (5s)
+
+            if (xSemaphoreTake(xMotorPowerMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                // Zatrzymujemy mieszadło
+                StopStirrer();
+                xSemaphoreGive(xMotorPowerMutex);
+            }
+
+            // Logika przejść po wymieszaniu
+            tubes_stirred_in_this_cycle++;
+
+            if (tubes_stirred_in_this_cycle < 2)
+            {
+                // Przechodzimy do drugiej probówki z pary
+                active_stir_seq_idx++;
+                currentState = LAB_STATE_STIRRER_POS;
+            }
+            else
+            {
+                // Obie probówki wymieszane, cykl zakończony. Jedziemy do spektrometru!
+                // Obie probówki wymieszane!
+                // Czas na spektrometr - znowu cofamy się do pierwszej probówki z pary
+                active_spectro_seq_idx = current_seq_idx - 2;
+                tubes_spectro_in_this_cycle = 0;
+                currentState = LAB_STATE_SPECTROMETER_POS;
+            }
+            break;
+        }
+        case LAB_STATE_SPECTROMETER_POS:
+        {
+            // Odczyt z tablicy i wyliczenie pozycji
+            uint8_t physical_tube = TUBE_SEQUENCE[active_spectro_seq_idx];
+
+            // UWAGA: Założyłem ten sam kierunek przyrostu obrotu co dla dozownika/mieszadła.
+            // Jeśli spektrometr fizycznie jest z innej strony i karuzela musi kręcić się odwrotnie,
+            // trzeba będzie zmienić tu znak (np. odjąć offset zamiast dodawać).
+            int16_t target_tube_pos = TUBE_SPECTRO_POS + ((6 - physical_tube) * TUBE_SPACING);
+
+            // Poprawka dla pełnego obrotu karuzeli (ominięcie blokady 1023)
+            if (target_tube_pos > 1023)
+                target_tube_pos -= 1230;
+            if (target_tube_pos < 0)
+                target_tube_pos = 0;
+            if (target_tube_pos > 1023)
+                target_tube_pos = 1023;
+
+            if (state_entry)
+            {
+                DynamixelCmd_t moveCmdTube = {DYNAMIXEL_TUBE_ID, (uint16_t)target_tube_pos};
+                xQueueSend(xDynamixelQueue, &moveCmdTube, portMAX_DELAY);
+            }
+
+            if (WaitForServoPosition(DYNAMIXEL_TUBE_ID, (uint16_t)target_tube_pos, 5000))
+            {
+                currentState = LAB_STATE_SPECTROMETER_FLASH;
+            }
+            else
+            {
+                EmergencyStopMotors();
+                currentState = LAB_STATE_IDLE;
+            }
+            break;
+        }
+
+        case LAB_STATE_SPECTROMETER_FLASH:
+        {
+            if (state_entry)
+            {
+                // 1. Włączamy żarówkę (wysyła ramkę CAN z daną 1)
+                Spectrometer_SetBulb(1);
+            }
+
+            // 2. Czekamy dokładnie 1 sekundę (żarówka świeci)
+            vTaskDelay(pdMS_TO_TICKS(1000));
+
+            // 3. Wyłączamy żarówkę (wysyła ramkę CAN z daną 0)
+            Spectrometer_SetBulb(0);
+
+            // Logika przejść po zbadaniu probówki
+            tubes_spectro_in_this_cycle++;
+
+            if (tubes_spectro_in_this_cycle < 2)
+            {
+                // Przechodzimy do drugiej probówki z pary
+                active_spectro_seq_idx++;
+                currentState = LAB_STATE_SPECTROMETER_POS;
+            }
+            else
+            {
+                // Obie probówki zbadane i oświetlone!
+                currentState = LAB_STATE_RESET_READY;
+            }
+            break;
+        }
+
+        case LAB_STATE_RESET_READY:
+            currentState = LAB_STATE_IDLE;
+            break;
+
         default:
             currentState = LAB_STATE_IDLE;
             break;
@@ -387,30 +549,16 @@ void vTaskDynamixel(void* pvParameters)
 
     for (;;)
     {
-        // Task zasypia i czeka, aż w kolejce pojawi się komenda
         if (xQueueReceive(xDynamixelQueue, &currentCmd, portMAX_DELAY) == pdTRUE)
         {
-
             EventBits_t events = xEventGroupGetBits(xSystemEvents);
 
-            // ZABEZPIECZENIE 1: SCRAM
             if (events & BIT_SCRAM_ACTIVE)
-            {
-                continue; // Ignorujemy komendę
-            }
-
-            // ZABEZPIECZENIE 2: Wiertło w dół = blokada rewolwerów!
+                continue;
             if (events & BIT_DRILL_LOWERED)
-            {
-                // Tutaj w przyszłości możemy wysłać ramkę błędu po CAN do Bena
-                continue; // Wiertło jest w dół, odrzucamy komendę obrotu
-            }
+                continue;
 
-            // --- WYSYŁANIE RAMKI UART ---
-            // Jeśli tu dotarliśmy, jest bezpiecznie. Wysyłamy fizycznie komendę.
             AX12_SetGoalPosition(currentCmd.servo_id, currentCmd.target_position);
-
-            // Mały delay, żeby nie zasypać magistrali UART
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
@@ -420,12 +568,14 @@ void LabRTOS_Init(void)
 {
     xSystemEvents = xEventGroupCreate();
     xMotorPowerMutex = xSemaphoreCreateMutex();
-    xUartMutex = xSemaphoreCreateMutex();
+    // Zabezpieczamy muteks dla UART jeśli jeszcze go nie ma
+    if (xUartMutex == NULL)
+    {
+        xUartMutex = xSemaphoreCreateMutex();
+    }
 
     xDynamixelQueue = xQueueCreate(5, sizeof(DynamixelCmd_t));
 
-    // Tworzenie tasków[cite: 3]
     xTaskCreate(vTaskLabSequence, "AutoSeq", 512, NULL, tskIDLE_PRIORITY + 2, NULL);
-
     xTaskCreate(vTaskDynamixel, "Dynamixel", 256, NULL, tskIDLE_PRIORITY + 3, NULL);
 }
