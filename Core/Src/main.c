@@ -30,6 +30,8 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "SEGGER_SYSVIEW.h"
+#include "FreeRTOS.h"
+#include "queue.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -112,7 +114,7 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 // Tworzenie zadania (Czyste API FreeRTOS zamiast osThreadCreate)
-  HAL_CAN_Start(&hcan);
+
   SEGGER_SYSVIEW_Conf();
   MotorsControl_Init();
   LabRTOS_Init();
@@ -175,6 +177,24 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 void vApplicationTickHook( void ) {
     // Kod tutaj wykonywałby się przy każdym przerwaniu SysTick
+}
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+    // ZŁOTA LINIA OBRONY: Jeśli kolejka jeszcze nie istnieje, po prostu zignoruj ramkę!
+    if (xCanMsgQueue == NULL) return;
+    //if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) return;
+
+    CAN_RxHeaderTypeDef RxHeader;
+    CanMsg_t rxMsg;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, rxMsg.Data) == HAL_OK)
+    {
+        rxMsg.StdId = RxHeader.StdId;
+        xQueueSendFromISR(xCanMsgQueue, &rxMsg, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
 }
 /* USER CODE END 4 */
 
