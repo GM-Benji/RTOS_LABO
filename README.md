@@ -25,9 +25,16 @@ Projekt oprogramowania wbudowanego dla zrobotyzowanego laboratorium pobierające
 * **PA9 (USART1_TX):** Linia DATA (Single-Wire / Half-Duplex). Wymagany zewnętrzny rezystor Pull-up (~4.7kΩ - 10kΩ) do 5V. Baudrate: 1 000 000 bps.
   * **ID 0x1E (30):** Dolny rewolwer (probówki). Baza: 790, Odstęp: 123 (36°). Pozycja bezpieczna: 1023.
   * **ID 0x01 (01):** Górny rewolwer (strzykawki/odczynniki). Pozycja bezpieczna: 600.
-* *Uwaga sprzętowa:* Zaimplementowano programowe "pływające okno" odczytu oraz sprzętowe czyszczenie bufora UART (`__HAL_UART_CLEAR_OREFLAG`), aby wyeliminować zakłócenia (glitche) pojawiające się przy przełączaniu pinu w trybie Half-Duplex.
+* *Uwaga sprzętowa:* Zaimplementowano programowe "pływające okno" odczytu oraz sprzętowe czyszczenie bufora UART, aby wyeliminować zakłócenia w trybie Half-Duplex. Ze względu na martwą strefę potencjometru serwa (1024-1229), system korzysta z wyselekcjonowanej sekwencji gniazd: `{6, 4, 2, 0}`.
 
-### 5. Wejścia sygnałowe (Czujniki i Przyciski)
+### 5. Komunikacja CAN (Magistrala Systemowa)
+* **Baudrate:** 500 kbps (Standard ID, 11-bit, DLC=8).
+* **ID 0x095:** Ramka sterowania systemem (0x01 = Start Auto, 0x02 = SCRAM, 0x03 = Tryb Manualny).
+* **ID 0x096:** Tryb manualny (sterowanie Serwem 1, Mieszadłem, Wiertłem).
+* **ID 0x097:** Tryb manualny (sterowanie Serwem 2).
+* **ID 0x098:** Sterowanie modułem spektrometru (TX: 0x01 = błysk 1s).
+
+### 6. Wejścia sygnałowe (Czujniki i Przyciski)
 * **PB12:** Krańcówka wiertła `DRILL_HOME_SW` (GPIO Input + Pull-Up). Zewrzeć do GND w celu wyzwolenia.
 * **PB13:** Przycisk startu `S_SWITCH` (GPIO Input + Pull-Up).
 
@@ -35,53 +42,46 @@ Projekt oprogramowania wbudowanego dla zrobotyzowanego laboratorium pobierające
 
 ## 🏗️ Struktura Oprogramowania (Moduły)
 
-Kod został podzielony na logiczne warstwy, oddzielające sprzęt od logiki operacyjnej:
-
-* `main.c`: Konfiguracja wygenerowana przez STM32CubeMX, inicjalizacja układów i start schedulera RTOS.
-* `motors.h` / `motors.c`: Warstwa abstrakcji sprzętu (HAL) dla silników DC. Obsługuje sprzętowe PWM, 32-bitowy enkoder programowy oraz debouncing przycisków.
-* `dynamixel.h` / `dynamixel.c`: Niskopoziomowy sterownik dla serw AX-12A. Realizuje zamkniętą pętlę sterowania (odczyt pozycji z rejestru `0x24`), spowolnienie ruchu (rejestr `0x20`) i zabezpiecza komunikację muteksem.
-* `lab_sequence.h` / `lab_sequence.c`: Serce systemu. Zawiera zadania (Tasks) FreeRTOS, maszyny stanów, oraz mechanizmy IPC.
+Kod został podzielony na logiczne warstwy:
+* `main.c`: Konfiguracja wygenerowana przez STM32CubeMX, start CAN i schedulera RTOS.
+* `motors.h/c`: Warstwa abstrakcji sprzętu (HAL) dla silników DC. Obsługuje sprzętowe PWM i 32-bitowy enkoder programowy.
+* `dynamixel.h/c`: Niskopoziomowy sterownik dla serw AX-12A. Realizuje zamkniętą pętlę sterowania i chroni magistralę muteksem.
+* `lab_sequence.h/c`: Serce systemu. Zawiera zadania (Tasks) FreeRTOS, maszynę stanów cyklu laboratoryjnego, obsługę poleceń CAN oraz tryb ręczny.
 
 ---
 
-## ⚙️ FreeRTOS - Konfiguracja i IPC (Inter-Process Communication)
+## ⚙️ FreeRTOS - Konfiguracja i IPC 
 
-System wykorzystuje natywne API FreeRTOS z następującymi mechanizmami:
+System wykorzystuje natywne API FreeRTOS (Stos: 8192 B) z następującymi mechanizmami:
 
 ### Zadania (Tasks)
-1. `vTaskLabSequence` (Priorytet: Normalny+2) - Główna maszyna stanów realizująca cykl pracy laboratorium.
-2. `vTaskDynamixel` (Priorytet: Normalny+3) - Task odbierający komendy z kolejki i wysyłający ramki UART do serw (zabezpieczony przed ruchem przy opuszczonym wiertle).
+1. `vTaskLabSequence` (Priorytet: Normalny+2) - Główna maszyna stanów cyklu automatycznego.
+2. `vTaskDynamixel` (Priorytet: Normalny+3) - Obsługa sprzętowa UART dla serw.
+3. `vTaskCanHandler` (Priorytet: Normalny+3) - Odbiór i parsowanie ramek z magistrali CAN (zarządzanie systemem i tryb manualny).
 
 ### Bezpieczeństwo i Synchronizacja
-* **`xSystemEvents` (Event Group):** Przechowuje globalne flagi stanu systemu (`BIT_SCRAM_ACTIVE`, `BIT_DRILL_LOWERED`).
-* **`xMotorPowerMutex` (Mutex):** Gwarantuje wzajemne wykluczanie pracy silnika wiertła i silnika mieszadła.
-* **`xUartMutex` (Mutex):** Zapobiega kolizjom ramek na jednoprzewodowej magistrali UART (blokuje nadawanie komend z kolejki, gdy maszyna stanów odpytuje serwo o aktualną pozycję).
-* **Closed-Loop Dynamixel:** Maszyna stanów nie przechodzi do kolejnego kroku, dopóki fizycznie nie potwierdzi osiągnięcia zadanej pozycji przez serwa (z marginesem tolerancji i 5-sekundowym timeoutem).
+* **`xSystemEvents` (Event Group):** Flagi stanu systemu (`BIT_SCRAM_ACTIVE`, `BIT_MANUAL_MODE`, `BIT_START_AUTO`).
+* **`xCanMsgQueue` (Queue):** Bezpieczna kolejka przekazująca odebrane ramki CAN z przerwania `RxFifo0` do taska.
+* **`xMotorPowerMutex` & `xUartMutex`:** Zabezpieczają zasoby sprzętowe przed jednoczesnym dostępem z różnych zadań.
+* **Przerwania (NVIC):** Przerwanie `CAN RX0` ma wymuszony priorytet `5`, aby bezpiecznie współpracować z funkcjami `...FromISR` systemu FreeRTOS.
 
 ---
 
 ## 🚀 Maszyna Stanów (Logika Operacyjna)
 
-Cykl pracy laboratorium przechodzi przez zdefiniowane stany (`LabState_t`):
-1. **IDLE:** Oczekiwanie na sygnał z pinu PB13 (lub CAN).
-2. **HOMING:** Dojazd wiertła w górę do momentu wciśnięcia krańcówki (PB12). Reset enkodera.
-3. **HOMING_REVOLVERS:** Powolny wyjazd obu rewolwerów na pozycje bezpieczne (1023 i 600), aby uniknąć kolizji wiertła z probówkami.
-4. **DRILLING:** Włączenie obrotów CW i zjazd w dół na zadaną głębokość na podstawie enkodera.
-5. **RETRACT:** Wycofanie wiertła nad rewolwer.
-6. **TUBE_POS:** Podjazd dolnego rewolweru na pozycję wyliczoną ze wzoru (Baza 790 - Indeks * 123). Oczekiwanie na potwierdzenie sprzętowe osiągnięcia pozycji.
-7. **FILL_TUBE:** Zrzucanie gleby (obroty CCW przez 2 sekundy). Logika zakłada, że jeden zjazd wiertła wystarcza na napełnienie 2 probówek. System zapętla się z punktem 6 dla nieparzystych indeksów.
-8. *Kolejne kroki: REAGENT_POS, DOSING, STIRRER_POS, STIRRING, SPECTROMETER_POS, SPECTROMETER_FLASH...*
-
----
-
-## 🛠️ Ważne notatki środowiskowe (STM32CubeMX)
-* FreeRTOS wdrożony metodą "Bare-Metal" (pominięcie CMSIS-V2 z CubeMX). Przerwania `SysTick`, `SVC` i `PendSV` są zmapowane sprzętowo w `FreeRTOSConfig.h`.
-* Zegar Timebase Source dla `HAL_Delay` ustawiony na **TIM2**.
-* Przerwania włączone dla `TIM2` (Timebase) oraz `TIM4` (Update/Overflow dla enkodera).
+Cykl pracy został zaprojektowany do obsługi par probówek w celu optymalizacji i ominięcia martwych stref serwomechanizmów:
+1. **IDLE:** Oczekiwanie na sygnał z przycisku lub ramkę CAN (ID: 0x095).
+2. **HOMING:** Zerowanie układu.
+3. **DRILLING & FILL_TUBE:** Odwiert i naprzemienne zasypywanie dwóch probówek z pary ziemią.
+4. **REAGENT_POS & DOSING:** Podjazd i zadozowanie odczynników z górnego rewolweru do obu napełnionych probówek.
+5. **STIRRER_POS & STIRRING:** Mieszanie każdej z probówek przez 5 sekund.
+6. **SPECTROMETER_FLASH:** Oświetlenie żarówką (komenda CAN) każdej probówki pod spektrometrem na 1 sekundę.
 
 ---
 
 ## 📋 TODO (Następne kroki)
-- [ ] Implementacja magistrali CAN.
-- [ ] Dokończenie stanów dozowania (obsługa pompek/elektrozaworów w `LAB_STATE_DOSING`).
-- [ ] Konfiguracja pinu wyzwalającego błysk dla spektrometru.
+- [x] Implementacja magistrali CAN (tryb automatyczny i ręczny).
+- [x] Konfiguracja oświetlenia spektrometru (ramka 0x098).
+- [x] Ominięcie martwej strefy serw AX-12A w kodzie.
+- [ ] Refaktoryzacja `lab_sequence.c` (wydzielenie obsługi CAN do osobnego pliku).
+- [ ] Testy wytrzymałościowe pełnego cyklu mechanicznego z glebą.
