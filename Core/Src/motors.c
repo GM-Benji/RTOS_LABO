@@ -29,6 +29,7 @@ volatile int32_t encoder_overflows = 0;
 // ==========================================================
 void SetDrillSpinSpeed_Talon(int8_t speed_percent)
 {
+    speed_percent *=-1;
     if (speed_percent > 100)
         speed_percent = 100;
     if (speed_percent < -100)
@@ -56,14 +57,16 @@ void SetDrillLoweringSpeed_MC34931(uint16_t speed_pwm, uint8_t direction)
     else if (direction == 1)
     { // W DÓŁ
         // IN1 na 0, IN2 dostaje PWM[cite: 2]
-        __HAL_TIM_SET_COMPARE(&htim3, DRILL_LOWER_IN1_CH, 0);
-        __HAL_TIM_SET_COMPARE(&htim3, DRILL_LOWER_IN2_CH, speed_pwm);
+          __HAL_TIM_SET_COMPARE(&htim3, DRILL_LOWER_IN2_CH, 0);
+        __HAL_TIM_SET_COMPARE(&htim3, DRILL_LOWER_IN1_CH, speed_pwm);
     }
     else if (direction == 2)
     { // W GÓRĘ
         // IN2 na 0, IN1 dostaje PWM[cite: 2]
-        __HAL_TIM_SET_COMPARE(&htim3, DRILL_LOWER_IN2_CH, 0);
-        __HAL_TIM_SET_COMPARE(&htim3, DRILL_LOWER_IN1_CH, speed_pwm);
+
+
+        __HAL_TIM_SET_COMPARE(&htim3, DRILL_LOWER_IN1_CH, 0);
+        __HAL_TIM_SET_COMPARE(&htim3, DRILL_LOWER_IN2_CH, speed_pwm);
     }
 }
 
@@ -79,12 +82,12 @@ void SetStirrerSpeed_MC34931(uint16_t speed_pwm, uint8_t direction)
         __HAL_TIM_SET_COMPARE(&htim3, STIRRER_IN1_CH, 0);
         __HAL_TIM_SET_COMPARE(&htim3, STIRRER_IN2_CH, 0);
     }
-    else if (direction == 1)
+    else if (direction == 2)
     {
         __HAL_TIM_SET_COMPARE(&htim3, STIRRER_IN1_CH, 0);
         __HAL_TIM_SET_COMPARE(&htim3, STIRRER_IN2_CH, speed_pwm);
     }
-    else if (direction == 2)
+    else if (direction == 1)
     {
         __HAL_TIM_SET_COMPARE(&htim3, STIRRER_IN2_CH, 0);
         __HAL_TIM_SET_COMPARE(&htim3, STIRRER_IN1_CH, speed_pwm);
@@ -201,5 +204,7 @@ uint8_t IsDrillHomed(void)
     return (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_12) == GPIO_PIN_RESET) ? 1 : 0;
 }
 
-// Zwraca 1, jeśli przycisk S_SWITCH (PB13) jest wciśnięty (zwarty do masy)
-uint8_t IsStartSwitchPressed(void) { return (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13) == GPIO_PIN_RESET) ? 1 : 0; }
+// Zwraca 1, jeśli dolna krańcówka (PB13) jest wciśnięta
+uint8_t IsDrillAtBottomLimit(void) { 
+    return (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13) == GPIO_PIN_RESET) ? 1 : 0; 
+}

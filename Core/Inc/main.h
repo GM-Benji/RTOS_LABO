@@ -74,6 +74,8 @@ void Error_Handler(void);
 #define DRILL_HOME_SW_GPIO_Port GPIOB
 #define S_SWITCH_Pin GPIO_PIN_13
 #define S_SWITCH_GPIO_Port GPIOB
+#define UV_Pin GPIO_PIN_15
+#define UV_GPIO_Port GPIOB
 #define TMS_Pin GPIO_PIN_13
 #define TMS_GPIO_Port GPIOA
 #define TCK_Pin GPIO_PIN_14

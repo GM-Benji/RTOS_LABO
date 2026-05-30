@@ -15,4 +15,6 @@ extern QueueHandle_t xCanMsgQueue;
 
 void LabRTOS_Init(void); // Funkcja tworząca taski i obiekty RTOS
 
+#define TALON_SPEED 20
+
 #endif
